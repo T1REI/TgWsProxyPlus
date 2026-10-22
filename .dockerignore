@@ -1,0 +1,7 @@
+target
+dist
+upstream
+tests
+.git
+**/*.log
+**/config.json

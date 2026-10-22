@@ -1,0 +1,55 @@
+name: Rust checks and builds
+on: [push, pull_request, workflow_dispatch]
+permissions:
+  contents: read
+jobs:
+  check:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            asset: TgWsProxyPlus-windows-x86_64.exe
+            binary: target/release/TgWsProxyPlus.exe
+          - os: windows-11-arm
+            asset: TgWsProxyPlus-windows-aarch64.exe
+            binary: target/release/TgWsProxyPlus.exe
+          - os: ubuntu-latest
+            asset: TgWsProxyPlus-linux-x86_64
+            binary: target/release/TgWsProxyPlus
+          - os: macos-15-intel
+            asset: TgWsProxyPlus-macos-x86_64
+            binary: target/release/TgWsProxyPlus
+          - os: macos-latest
+            asset: TgWsProxyPlus-macos-aarch64
+            binary: target/release/TgWsProxyPlus
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install 1.96.0 --profile minimal --component rustfmt --component clippy
+      - run: rustup override set 1.96.0
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo test --locked --all-targets
+      - run: cargo test --locked --all-targets --no-default-features
+      - run: cargo build --release --locked
+      - name: Prepare package
+        shell: pwsh
+        env:
+          ASSET_NAME: ${{ matrix.asset }}
+          BINARY_PATH: ${{ matrix.binary }}
+        run: |
+          New-Item -ItemType Directory -Path dist -Force | Out-Null
+          Copy-Item -LiteralPath $env:BINARY_PATH -Destination "dist/$env:ASSET_NAME"
+          Copy-Item -LiteralPath LICENSE,LICENSE.upstream,THIRD_PARTY_NOTICES.txt,README.md -Destination dist
+          Copy-Item -LiteralPath docs -Destination dist -Recurse -Force
+          if ($IsWindows -and (Get-Item "dist/$env:ASSET_NAME").Length -gt 2MB) { throw 'EXE exceeds 2 MiB budget' }
+          $hash = (Get-FileHash "dist/$env:ASSET_NAME" -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  $env:ASSET_NAME" | Set-Content dist/SHA256SUMS.txt
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.asset }}
+          path: dist/
+          if-no-files-found: error

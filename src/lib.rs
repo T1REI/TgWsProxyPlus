@@ -1,0 +1,19 @@
+pub mod cli;
+pub mod config;
+pub mod crypto;
+pub mod fake_tls;
+pub mod framing;
+pub mod h2_channel;
+pub mod h2_transport;
+pub mod logging;
+pub mod network;
+pub mod pool;
+pub mod routing;
+pub mod server;
+pub mod stats;
+pub mod updates;
+
+pub const NAME: &str = "TgWsProxy+";
+pub const FILE_NAME: &str = "TgWsProxyPlus";
+pub const AUTHOR: &str = "T1REI";
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
