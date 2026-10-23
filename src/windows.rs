@@ -49,7 +49,6 @@ fn wide(value: impl AsRef<OsStr>) -> Vec<u16> {
 }
 
 pub fn attach_console() {
-    // SAFETY: Attaching to the parent console uses a predefined process identifier and no pointers.
     unsafe {
         AttachConsole(ATTACH_PARENT_PROCESS);
     }
@@ -60,12 +59,10 @@ pub fn show_error(text: &str) {
 }
 
 fn message(owner: HWND, text: &str, title: &str, style: u32) -> i32 {
-    // SAFETY: The UTF-16 buffers remain alive for this synchronous call; owner is null or a live app window.
     unsafe { MessageBoxW(owner, wide(text).as_ptr(), wide(title).as_ptr(), style) }
 }
 
 fn open(target: impl AsRef<OsStr>) -> Result<()> {
-    // SAFETY: ShellExecuteW only borrows these terminated UTF-16 arguments during the call.
     let result = unsafe {
         ShellExecuteW(
             null_mut(),
@@ -84,7 +81,6 @@ fn open(target: impl AsRef<OsStr>) -> Result<()> {
 }
 
 fn text(hwnd: HWND) -> String {
-    // SAFETY: All control handles originate in this UI thread; the buffer includes a terminating element.
     unsafe {
         let length = GetWindowTextLengthW(hwnd).max(0) as usize;
         let mut data = vec![0; length + 1];
@@ -94,7 +90,6 @@ fn text(hwnd: HWND) -> String {
 }
 
 fn set_text(hwnd: HWND, value: &str) {
-    // SAFETY: The app owns hwnd; SetWindowTextW copies the terminated string synchronously.
     unsafe {
         SetWindowTextW(hwnd, wide(value).as_ptr());
     }
@@ -102,13 +97,11 @@ fn set_text(hwnd: HWND, value: &str) {
 
 fn clipboard(owner: HWND, value: &str) -> Result<()> {
     let data = wide(value);
-    // SAFETY: The global allocation is sized for data, locked before copying, and transferred only after SetClipboardData succeeds.
     unsafe {
         ensure!(OpenClipboard(owner) != 0, "clipboard is busy");
         struct Clipboard;
         impl Drop for Clipboard {
             fn drop(&mut self) {
-                // SAFETY: This guard exists only after OpenClipboard succeeded on this thread.
                 unsafe {
                     CloseClipboard();
                 }
@@ -135,7 +128,6 @@ fn clipboard(owner: HWND, value: &str) -> Result<()> {
 
 fn autostart(enabled: bool, config_path: &Path) -> Result<()> {
     let name = wide("TgWsProxyPlus");
-    // SAFETY: Registry pointers refer to initialized local storage; every acquired key is closed.
     unsafe {
         let mut key = null_mut();
         let status = RegCreateKeyExW(
@@ -245,7 +237,6 @@ struct Ui {
 impl Ui {
     fn ru(&self) -> bool {
         if self.config.language == "auto" {
-            // SAFETY: Reading the current user's UI language takes no pointers and changes no system state.
             unsafe { GetUserDefaultUILanguage() & 0x03ff == 0x19 }
         } else {
             self.config.language != "en"
@@ -257,7 +248,6 @@ impl Ui {
 
     fn post(sender: &mpsc::Sender<Event>, hwnd: usize, event: Event) {
         if sender.send(event).is_ok() {
-            // SAFETY: PostMessageW does not dereference hwnd; it may fail harmlessly if the window was already destroyed.
             unsafe {
                 PostMessageW(hwnd as HWND, EVENT, 0, 0);
             }
@@ -323,7 +313,6 @@ impl Ui {
         id: usize,
     ) -> Result<HWND> {
         let [x, y, width, height] = bounds;
-        // SAFETY: The parent is live and class/text strings survive CreateWindowExW; control IDs are integer resource identifiers.
         unsafe {
             let hwnd = CreateWindowExW(
                 0,
@@ -403,7 +392,6 @@ impl Ui {
             [270, y, 395, height],
             100 + self.fields.len(),
         )?;
-        // SAFETY: handle is a live checkbox/combobox/edit control and all message parameters match its control class.
         unsafe {
             if matches!(kind, Kind::Check) {
                 SendMessageW(
@@ -742,7 +730,6 @@ impl Ui {
 
     fn show_page(&mut self, page: usize) {
         self.page = page;
-        // SAFETY: The handles are children of this window and remain valid until window destruction.
         unsafe {
             for field in &self.fields {
                 ShowWindow(
@@ -760,7 +747,6 @@ impl Ui {
     }
 
     fn rebuild_menu(&mut self) -> Result<()> {
-        // SAFETY: The UI owns these menus; labels are copied synchronously by AppendMenuW.
         unsafe {
             if !self.menu.is_null() {
                 DestroyMenu(self.menu);
@@ -803,13 +789,10 @@ impl Ui {
                             .parse::<f64>()
                             .with_context(|| format!("{}: expected a number", field.key))?
                     ),
-                    Kind::Check => {
-                        // SAFETY: field.handle is a checkbox created by field().
-                        serde_json::Value::Bool(
-                            unsafe { SendMessageW(field.handle, BM_GETCHECK, 0, 0) }
-                                == BST_CHECKED as isize,
-                        )
-                    }
+                    Kind::Check => serde_json::Value::Bool(
+                        unsafe { SendMessageW(field.handle, BM_GETCHECK, 0, 0) }
+                            == BST_CHECKED as isize,
+                    ),
                     Kind::Lines => serde_json::json!(
                         input
                             .lines()
@@ -853,7 +836,6 @@ impl Ui {
                 MB_OK,
             );
         }
-        // SAFETY: hwnd is the current live app window.
         unsafe {
             ShowWindow(self.hwnd, SW_HIDE);
         }
@@ -932,40 +914,33 @@ impl Ui {
                     set_text(field.handle, &crypto::hex(&crypto::random::<16>()?));
                 }
             }
-            SETTINGS => {
-                // SAFETY: hwnd is a live top-level window owned by this UI thread.
-                unsafe {
-                    ShowWindow(self.hwnd, SW_RESTORE);
-                    SetForegroundWindow(self.hwnd);
-                }
-            }
+            SETTINGS => unsafe {
+                ShowWindow(self.hwnd, SW_RESTORE);
+                SetForegroundWindow(self.hwnd);
+            },
             CANCEL => {
                 let current = serde_json::to_value(&self.config)?;
                 for field in &self.fields {
                     let value = &current[field.key];
                     match field.kind {
-                        Kind::Check => {
-                            // SAFETY: The handle is a live checkbox.
-                            unsafe {
-                                SendMessageW(
-                                    field.handle,
-                                    BM_SETCHECK,
-                                    if value.as_bool().unwrap_or(false) {
-                                        BST_CHECKED
-                                    } else {
-                                        BST_UNCHECKED
-                                    } as usize,
-                                    0,
-                                );
-                            }
-                        }
+                        Kind::Check => unsafe {
+                            SendMessageW(
+                                field.handle,
+                                BM_SETCHECK,
+                                if value.as_bool().unwrap_or(false) {
+                                    BST_CHECKED
+                                } else {
+                                    BST_UNCHECKED
+                                } as usize,
+                                0,
+                            );
+                        },
                         Kind::Choice => {
                             let choices: &[&str] = if field.key == "language" {
                                 &["ru", "en", "auto"]
                             } else {
                                 &["auto", "dark", "light"]
                             };
-                            // SAFETY: The handle is a live combobox and the index belongs to its fixed choices.
                             unsafe {
                                 SendMessageW(
                                     field.handle,
@@ -1003,7 +978,6 @@ impl Ui {
                         ),
                     }
                 }
-                // SAFETY: hwnd is live; hiding preserves it and its child controls.
                 unsafe {
                     ShowWindow(self.hwnd, SW_HIDE);
                 }
@@ -1021,7 +995,6 @@ impl Ui {
             }
             QUIT => {
                 self.proxy.take();
-                // SAFETY: Posting quit affects only this thread's message loop.
                 unsafe {
                     PostQuitMessage(0);
                 }
@@ -1077,7 +1050,6 @@ impl Ui {
 }
 
 unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESULT {
-    // SAFETY: Windows invokes this callback with its window's valid message parameters. GWLP_USERDATA points to a RefCell kept alive by run(); reentrant callbacks use try_borrow_mut.
     unsafe {
         if msg == WM_NCCREATE {
             let creation = &*(l as *const CREATESTRUCTW);
@@ -1224,14 +1196,12 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
 pub fn run(config: Config, path: PathBuf, first_run: bool) -> Result<()> {
     let first_run_marker = path.with_file_name(".first-run-done");
     let first_run = first_run || !first_run_marker.exists();
-    // SAFETY: This function owns the Windows message loop and all handles it creates. Ui storage outlives the window and GWLP_USERDATA is cleared before destruction. Each OS allocation is released on exit.
     unsafe {
         let lock = CreateMutexW(null(), 0, wide("Local\\TgWsProxyPlus").as_ptr());
         ensure!(!lock.is_null(), "cannot acquire single-instance mutex");
         struct Instance(HANDLE);
         impl Drop for Instance {
             fn drop(&mut self) {
-                // SAFETY: Instance owns a successfully created kernel handle.
                 unsafe {
                     CloseHandle(self.0);
                 }

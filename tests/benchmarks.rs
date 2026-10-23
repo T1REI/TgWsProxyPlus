@@ -19,10 +19,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 struct Allocator;
 static LIVE: AtomicIsize = AtomicIsize::new(0);
 static PEAK: AtomicIsize = AtomicIsize::new(0);
-// SAFETY: Allocation and deallocation are delegated unchanged to System; counters track requested bytes only.
 unsafe impl GlobalAlloc for Allocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        // SAFETY: The caller provides a valid allocation layout.
         let pointer = unsafe { System.alloc(layout) };
         if !pointer.is_null() {
             let live = LIVE.fetch_add(layout.size() as isize, Relaxed) + layout.size() as isize;
@@ -32,7 +30,6 @@ unsafe impl GlobalAlloc for Allocator {
     }
     unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
         LIVE.fetch_sub(layout.size() as isize, Relaxed);
-        // SAFETY: The caller provides the pointer and its original allocation layout.
         unsafe { System.dealloc(pointer, layout) }
     }
 }
