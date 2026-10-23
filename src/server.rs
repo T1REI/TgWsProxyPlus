@@ -51,6 +51,7 @@ pub async fn serve(
     let mut clients = JoinSet::new();
     let mut background = JoinSet::new();
     background.spawn(routing.pool.clone().maintain());
+    background.spawn(routing.clone().maintain());
     if routing.config.cfproxy {
         background.spawn(routing.clone().refresh_domains());
     }
@@ -67,7 +68,7 @@ pub async fn serve(
     loop {
         tokio::select! {
             _ = &mut shutdown => break,
-            _ = stats_tick.tick() => log::info!("stats: {}", routing.stats.summary()),
+            _ = stats_tick.tick() => { log::info!("stats: {}", routing.stats.summary()); for line in routing.report() { log::info!("performance: {line}"); } },
             Some(result) = clients.join_next(), if !clients.is_empty() => { if let Err(error) = result { log::error!("client task failed: {error}"); } }
             Some(result) = background.join_next(), if !background.is_empty() => { if let Err(error) = result { log::error!("background task failed: {error}"); } }
             accepted = listener.accept() => {
@@ -205,8 +206,11 @@ async fn handle_client(
         }
     };
     let relay = crypto::relay_init(init.protocol, init.dc, init.media)?;
-    let upstream = routing.choose(&init).await?;
-    match upstream {
+    let started = std::time::Instant::now();
+    let selected = routing.choose(&init).await?;
+    let stream = routing.metrics.observe(selected.route, stream, started);
+    let _session = selected.session;
+    match selected.upstream {
         Upstream::Tcp(mut remote) => {
             timeout(WRITE_TIMEOUT, remote.write_all(&relay.bytes)).await??;
             bridge_tcp(stream, Box::new(remote), init, relay, &routing.stats).await
@@ -231,7 +235,7 @@ async fn forward<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     mut encrypt: Cipher,
     count: &std::sync::atomic::AtomicU64,
 ) -> Result<()> {
-    let mut buffer = vec![0; 64 * 1024];
+    let mut buffer = vec![0; 32 * 1024];
     loop {
         let n = reader.read(&mut buffer).await?;
         if n == 0 {
@@ -277,8 +281,9 @@ pub async fn bridge_ws(
     let (mut sink, mut source) = socket.split();
     let (mut reader, mut writer) = tokio::io::split(client);
     let upload = async {
-        let mut buffer = vec![0; 64 * 1024];
+        let mut buffer = vec![0; 32 * 1024];
         let mut splitter = Splitter::new(init.protocol);
+        let mut plain = Vec::new();
         loop {
             let n = reader.read(&mut buffer).await?;
             if n == 0 {
@@ -290,11 +295,10 @@ pub async fn bridge_ws(
                 return Ok::<_, anyhow::Error>(());
             }
             init.decrypt.apply_keystream(&mut buffer[..n]);
-            let plain = if split {
-                buffer[..n].to_vec()
-            } else {
-                Vec::new()
-            };
+            if split {
+                plain.clear();
+                plain.extend_from_slice(&buffer[..n]);
+            }
             relay.encrypt.apply_keystream(&mut buffer[..n]);
             let parts = if split {
                 splitter.push(&buffer[..n], &plain)?
@@ -337,13 +341,21 @@ pub async fn diagnose(config: Config) -> Result<Vec<String>> {
     let redirects = crate::config::parse_dc_ips(&routing.config.dc_ip)?;
     let mut jobs = JoinSet::new();
     fn probe(
-        jobs: &mut JoinSet<(String, bool)>,
+        jobs: &mut JoinSet<(String, String)>,
         name: String,
         action: impl Future<Output = Result<()>> + Send + 'static,
     ) {
         jobs.spawn(async move {
-            let ok = matches!(timeout(Duration::from_secs(15), action).await, Ok(Ok(())));
-            (name, ok)
+            let began = std::time::Instant::now();
+            let status = match timeout(Duration::from_secs(15), action).await {
+                Ok(Ok(())) => format!("OK {}ms", began.elapsed().as_millis()),
+                Ok(Err(error)) => format!(
+                    "unavailable: {}",
+                    crate::logging::censor(&error.to_string())
+                ),
+                Err(_) => "timeout 15000ms".into(),
+            };
+            (name, status)
         });
     }
     for dc in [1, 2, 3, 4, 5, 203] {
@@ -415,8 +427,8 @@ pub async fn diagnose(config: Config) -> Result<Vec<String>> {
     }
     let mut results = Vec::new();
     while let Some(result) = jobs.join_next().await {
-        let (name, ok) = result?;
-        results.push(format!("{name}: {}", if ok { "OK" } else { "unavailable" }));
+        let (name, status) = result?;
+        results.push(format!("{name}: {status}"));
     }
     results.sort();
     Ok(results)

@@ -9,7 +9,8 @@ Usage: TgWsProxyPlus [--console | --tray | --settings] [options]\n\
   --host IP --port N --secret HEX\n\
   --dc-ip [DC:IP]        Repeatable; without value clears direct WS routes\n\
   --pool-size N          Warm connections per DC (0 disables direct WS)\n\
-  --buf-kb N --max-connections N\n\
+  --buf-kb N             Socket buffer in KiB; 0 uses OS autotuning (default)\n\
+  --max-connections N\n\
   --cfproxy-domain NAME  Repeatable, comma/space separated\n\
   --cfproxy-worker-domain NAME\n\
   --no-cfproxy --no-h2 --no-secure --force-test-dc\n\

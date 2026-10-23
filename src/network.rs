@@ -45,8 +45,10 @@ impl Network {
     pub fn configure(&self, stream: &TcpStream) -> Result<()> {
         stream.set_nodelay(true)?;
         let socket = socket2::SockRef::from(stream);
-        socket.set_recv_buffer_size(self.buffer)?;
-        socket.set_send_buffer_size(self.buffer)?;
+        if self.buffer > 0 {
+            socket.set_recv_buffer_size(self.buffer)?;
+            socket.set_send_buffer_size(self.buffer)?;
+        }
         socket
             .set_tcp_keepalive(&socket2::TcpKeepalive::new().with_time(Duration::from_secs(60)))?;
         Ok(())

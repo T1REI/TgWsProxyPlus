@@ -21,6 +21,9 @@ pub struct Config {
     pub max_connections: usize,
     pub cfproxy: bool,
     pub h2: bool,
+    pub h2_max_connections: usize,
+    pub h2_stream_window_kb: usize,
+    pub h2_connection_window_kb: usize,
     pub cfproxy_user_domain_enabled: bool,
     #[serde(deserialize_with = "domain_list")]
     pub cfproxy_user_domain: Vec<String>,
@@ -50,11 +53,14 @@ impl Default for Config {
             port: 1443,
             secret: String::new(),
             dc_ip: vec!["2:149.154.167.220".into(), "4:149.154.167.220".into()],
-            buf_kb: 256,
+            buf_kb: 0,
             pool_size: 4,
             max_connections: 512,
             cfproxy: true,
             h2: true,
+            h2_max_connections: 2,
+            h2_stream_window_kb: 1024,
+            h2_connection_window_kb: 4096,
             cfproxy_user_domain_enabled: false,
             cfproxy_user_domain: vec![],
             cfproxy_worker_enabled: false,
@@ -153,8 +159,23 @@ impl Config {
         ensure!(self.port > 0, "port must be between 1 and 65535");
         self.secret_bytes()?;
         parse_dc_ips(&self.dc_ip)?;
-        ensure!((4..=4096).contains(&self.buf_kb), "buf_kb must be 4..4096");
+        ensure!(
+            self.buf_kb == 0 || (4..=4096).contains(&self.buf_kb),
+            "buf_kb must be 0 (automatic) or 4..4096"
+        );
         ensure!(self.pool_size <= 32, "pool_size must be 0..32");
+        ensure!(
+            (1..=3).contains(&self.h2_max_connections),
+            "h2_max_connections must be 1..3"
+        );
+        ensure!(
+            (64..=4096).contains(&self.h2_stream_window_kb),
+            "h2_stream_window_kb must be 64..4096"
+        );
+        ensure!(
+            (self.h2_stream_window_kb..=16384).contains(&self.h2_connection_window_kb),
+            "h2_connection_window_kb must be at least the stream window and at most 16384"
+        );
         ensure!(
             (1..=16384).contains(&self.max_connections),
             "max_connections must be 1..16384"

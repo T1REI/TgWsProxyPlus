@@ -1,9 +1,9 @@
 fn main() -> std::io::Result<()> {
-    println!("cargo:rerun-if-changed=assets/icon.ico");
+    println!("cargo:rerun-if-changed=icon.ico");
     println!("cargo:rerun-if-changed=assets/windows.manifest");
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
         winresource::WindowsResource::new()
-            .set_icon("assets/icon.ico")
+            .set_icon("icon.ico")
             .set_manifest_file("assets/windows.manifest")
             .set("ProductName", "TgWsProxy+ / TgWsProxyPlus")
             .set(

@@ -10,9 +10,9 @@ use std::{
     future::poll_fn,
     sync::{
         Arc,
-        atomic::{AtomicU8, Ordering::Relaxed},
+        atomic::{AtomicU8, AtomicUsize, Ordering::Relaxed},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tokio::{
     sync::{OwnedSemaphorePermit, Semaphore},
@@ -21,6 +21,20 @@ use tokio::{
 };
 
 pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(65);
+
+#[derive(Clone, Copy)]
+pub struct Settings {
+    pub stream_window: u32,
+    pub connection_window: u32,
+}
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            stream_window: 1024 * 1024,
+            connection_window: 4 * 1024 * 1024,
+        }
+    }
+}
 
 pub struct Response {
     pub status: u16,
@@ -43,6 +57,7 @@ pub struct HttpLane {
     requests: Semaphore,
     memory: Arc<Semaphore>,
     stats: Arc<Stats>,
+    sessions: AtomicUsize,
 }
 
 impl HttpLane {
@@ -53,10 +68,27 @@ impl HttpLane {
     }
 
     pub async fn from_stream(stream: Stream, host: &str, stats: Arc<Stats>) -> Result<Arc<Self>> {
+        Self::with_settings(
+            stream,
+            host,
+            stats,
+            Settings::default(),
+            Arc::new(Semaphore::new(32 * 1024 * 1024)),
+        )
+        .await
+    }
+
+    pub async fn with_settings(
+        stream: Stream,
+        host: &str,
+        stats: Arc<Stats>,
+        settings: Settings,
+        memory: Arc<Semaphore>,
+    ) -> Result<Arc<Self>> {
         let (sender, connection) = h2::client::Builder::new()
             .enable_push(false)
-            .initial_window_size(256 * 1024)
-            .initial_connection_window_size(4 * 1024 * 1024)
+            .initial_window_size(settings.stream_window)
+            .initial_connection_window_size(settings.connection_window)
             .max_concurrent_streams(64)
             .max_header_list_size(32 * 1024)
             .handshake(stream)
@@ -71,9 +103,26 @@ impl HttpLane {
             sender,
             _driver: Driver(driver),
             requests: Semaphore::new(64),
-            memory: Arc::new(Semaphore::new(32 * 1024 * 1024)),
+            memory,
             stats,
+            sessions: AtomicUsize::new(0),
         }))
+    }
+
+    pub fn sessions(&self) -> usize {
+        self.sessions.load(Relaxed)
+    }
+    pub fn add_session(&self) {
+        self.sessions.fetch_add(1, Relaxed);
+    }
+    pub fn remove_session(&self) {
+        self.sessions.fetch_sub(1, Relaxed);
+    }
+    pub fn load(&self) -> usize {
+        64 - self.requests.available_permits()
+    }
+    pub fn closed(&self) -> bool {
+        self._driver.0.is_finished()
     }
 
     pub async fn preflight(&self) -> Result<()> {
@@ -120,6 +169,7 @@ impl HttpLane {
         limit: usize,
         progress: Option<Arc<AtomicU8>>,
     ) -> Result<Response> {
+        let waiting = Instant::now();
         let _request = self.requests.acquire().await?;
         ensure!(
             body.len() + limit <= 32 * 1024 * 1024,
@@ -130,6 +180,10 @@ impl HttpLane {
             .clone()
             .acquire_many_owned((body.len() + limit) as u32)
             .await?;
+        self.stats
+            .h2_wait_us
+            .fetch_add(waiting.elapsed().as_micros() as u64, Relaxed);
+        self.stats.h2_waits.fetch_add(1, Relaxed);
         let head = method == Method::HEAD;
         let request = Request::builder()
             .method(method)
@@ -177,7 +231,16 @@ impl HttpLane {
             );
         }
         let mut stream = response.into_body();
-        let mut buffer = Vec::new();
+        let capacity = if head {
+            0
+        } else {
+            headers
+                .get("content-length")
+                .and_then(|v| v.to_str().ok()?.parse::<usize>().ok())
+                .unwrap_or(0)
+                .min(limit)
+        };
+        let mut buffer = Vec::with_capacity(capacity);
         while let Some(chunk) = stream.data().await {
             let chunk = chunk?;
             ensure!(

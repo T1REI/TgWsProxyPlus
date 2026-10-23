@@ -181,6 +181,8 @@ fn autostart(enabled: bool, config_path: &Path) -> Result<()> {
 }
 
 struct ProxyThread {
+    stats: std::sync::Arc<Stats>,
+    metrics: std::sync::Arc<tg_ws_proxy_plus::performance::Metrics>,
     stop: Option<tokio::sync::oneshot::Sender<()>>,
     thread: Option<thread::JoinHandle<()>>,
 }
@@ -268,6 +270,10 @@ impl Ui {
         let tx = self.sender.clone();
         let hwnd = self.hwnd as usize;
         let (stop, stopped) = tokio::sync::oneshot::channel();
+        let metrics = std::sync::Arc::new(tg_ws_proxy_plus::performance::Metrics::default());
+        let worker_metrics = metrics.clone();
+        let stats = std::sync::Arc::new(Stats::default());
+        let worker_stats = stats.clone();
         let thread = thread::Builder::new().name("proxy".into()).spawn(move || {
             let result = (|| -> Result<()> {
                 let runtime = tokio::runtime::Builder::new_current_thread()
@@ -279,11 +285,11 @@ impl Ui {
                             .await
                             .context("cannot listen; check the address and port")?;
                     let network = Network::new(config.buf_kb * 1024)?;
-                    let routing = Routing::new(
-                        std::sync::Arc::new(config),
-                        network,
-                        std::sync::Arc::new(Stats::default()),
-                    );
+                    let mut routing =
+                        Routing::new(std::sync::Arc::new(config), network, worker_stats);
+                    if let Some(routing) = std::sync::Arc::get_mut(&mut routing) {
+                        routing.metrics = worker_metrics;
+                    }
                     Self::post(
                         &tx,
                         hwnd,
@@ -300,6 +306,8 @@ impl Ui {
             }
         })?;
         self.proxy = Some(ProxyThread {
+            stats,
+            metrics,
             stop: Some(stop),
             thread: Some(thread),
         });
@@ -451,6 +459,7 @@ impl Ui {
             self.tr("Соединение", "Connection"),
             self.tr("Маршруты", "Routes"),
             self.tr("Дополнительно", "Advanced"),
+            self.tr("Быстродействие", "Performance"),
         ]
         .into_iter()
         .enumerate()
@@ -459,7 +468,7 @@ impl Ui {
                 "BUTTON",
                 label,
                 WS_TABSTOP,
-                [24 + index as i32 * 216, 45, 208, 28],
+                [24 + index as i32 * 162, 45, 154, 28],
                 PAGE + index,
             )?;
         }
@@ -602,8 +611,8 @@ impl Ui {
         )?;
         self.field(
             "buf_kb",
-            "Буфер сокета, КиБ",
-            "Socket buffer, KiB",
+            "Буфер, КиБ (0 — авто)",
+            "Buffer, KiB (0 = auto)",
             2,
             0,
             Kind::Number,
@@ -665,6 +674,32 @@ impl Ui {
             Kind::Choice,
         )?;
         self.field("appearance", "Оформление", "Appearance", 2, 8, Kind::Choice)?;
+        self.field(
+            "h2_max_connections",
+            "H2-соединений на сервер",
+            "H2 connections per server",
+            3,
+            0,
+            Kind::Number,
+        )?;
+        self.field(
+            "h2_stream_window_kb",
+            "H2-окно потока, КиБ",
+            "H2 stream window, KiB",
+            3,
+            1,
+            Kind::Number,
+        )?;
+        self.field(
+            "h2_connection_window_kb",
+            "H2-окно соединения, КиБ",
+            "H2 connection window, KiB",
+            3,
+            2,
+            Kind::Number,
+        )?;
+        let note = self.control("STATIC", self.tr("Маршруты выбираются по времени подключения, скорости и ошибкам.\r\nПулы растут по спросу и сокращаются в простое.\r\n\r\nТекущие измерения доступны через «Диагностика» в меню трея.\r\nОбщий бюджет тел HTTP/2: 32 МиБ на приложение.", "Routes adapt to connection time, throughput and errors.\r\nPools grow with demand and shrink when idle.\r\n\r\nOpen Diagnostics from the tray menu for current measurements.\r\nHTTP/2 body budget: 32 MiB for the application."), 0, [24, 280, 640, 160], 0)?;
+        self.labels.push((note, 3));
         self.status = self.control(
             "STATIC",
             self.tr("Прокси запускается…", "Proxy starting…"),
@@ -827,6 +862,15 @@ impl Ui {
 
     fn background(&self, update: bool, manual: bool) -> Result<()> {
         let config = self.config.clone();
+        let live = self
+            .proxy
+            .as_ref()
+            .map(|p| {
+                let mut lines = vec![p.stats.summary()];
+                lines.extend(p.metrics.report());
+                lines
+            })
+            .unwrap_or_default();
         let tx = self.sender.clone();
         let hwnd = self.hwnd as usize;
         thread::Builder::new()
@@ -855,7 +899,10 @@ impl Ui {
                                 }))
                             }
                         } else {
-                            Ok(Event::Message(server::diagnose(config).await?.join("\n")))
+                            let mut report = live;
+                            report.push("--- Connection probes ---".into());
+                            report.extend(server::diagnose(config).await?);
+                            Ok(Event::Message(report.join("\n")))
                         }
                     })
                 })();
@@ -979,7 +1026,7 @@ impl Ui {
                     PostQuitMessage(0);
                 }
             }
-            id if (PAGE..PAGE + 3).contains(&id) => self.show_page(id - PAGE),
+            id if (PAGE..PAGE + 4).contains(&id) => self.show_page(id - PAGE),
             _ => {}
         }
         Ok(())
@@ -1201,23 +1248,15 @@ pub fn run(config: Config, path: PathBuf, first_run: bool) -> Result<()> {
         }
         SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_SYSTEM_AWARE);
         let module = GetModuleHandleW(null());
-        let mut pixels = [0u8; 32 * 32 * 4];
-        for y in 0..32 {
-            for x in 0..32 {
-                let i = (y * 32 + x) * 4;
-                if (x as i32 - 16).pow(2) + (y as i32 - 16).pow(2) < 225 {
-                    pixels[i..i + 4].copy_from_slice(
-                        if x > 7 && x < 26 && y > 7 && y < 24 && (x + y < 35) && (x + 2 * y > 32) {
-                            &[255, 255, 255, 255]
-                        } else {
-                            &[220, 155, 35, 255]
-                        },
-                    );
-                }
-            }
-        }
-        let icon = CreateIcon(module, 32, 32, 1, 32, [0u8; 128].as_ptr(), pixels.as_ptr());
-        ensure!(!icon.is_null(), "cannot create tray icon");
+        let icon = LoadImageW(
+            module,
+            std::ptr::without_provenance::<u16>(1),
+            IMAGE_ICON,
+            GetSystemMetrics(SM_CXICON),
+            GetSystemMetrics(SM_CYICON),
+            LR_DEFAULTCOLOR,
+        ) as HICON;
+        ensure!(!icon.is_null(), "cannot load application icon resource");
         let class_name = wide(CLASS);
         let wc = WNDCLASSW {
             lpfnWndProc: Some(window_proc),

@@ -18,12 +18,14 @@ pub struct Stats {
     pub h2_requests: AtomicU64,
     pub h2_connections: AtomicU64,
     pub replays: AtomicU64,
+    pub h2_wait_us: AtomicU64,
+    pub h2_waits: AtomicU64,
 }
 
 impl Stats {
     pub fn summary(&self) -> String {
         format!(
-            "total={} active={} bad={} ws={} h2={} tcp={} cf={} front={} err={} pool={}/{} up={} down={} h2_req={} h2_tcp={} replays={}",
+            "total={} active={} bad={} ws={} h2={} tcp={} cf={} front={} err={} pool={}/{} up={} down={} h2_req={} h2_tcp={} replays={} h2_queue_avg_us={}",
             self.total.load(Relaxed),
             self.active.load(Relaxed),
             self.bad.load(Relaxed),
@@ -39,7 +41,8 @@ impl Stats {
             self.down.load(Relaxed),
             self.h2_requests.load(Relaxed),
             self.h2_connections.load(Relaxed),
-            self.replays.load(Relaxed)
+            self.replays.load(Relaxed),
+            self.h2_wait_us.load(Relaxed) / self.h2_waits.load(Relaxed).max(1)
         )
     }
 }

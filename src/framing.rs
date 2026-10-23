@@ -1,12 +1,14 @@
 use crate::crypto::{Protocol, random};
 use anyhow::{Result, ensure};
-use bytes::{Buf, Bytes, BytesMut};
+use bytes::{Bytes, BytesMut};
 
 pub const MAX_PACKET: usize = 4 * 1024 * 1024;
 
 pub struct Splitter {
     protocol: Protocol,
-    plain: BytesMut,
+    header: [u8; 4],
+    header_len: usize,
+    remaining: Option<usize>,
     encrypted: BytesMut,
     disabled: bool,
 }
@@ -47,7 +49,9 @@ impl Splitter {
     pub fn new(protocol: Protocol) -> Self {
         Self {
             protocol,
-            plain: BytesMut::new(),
+            header: [0; 4],
+            header_len: 0,
+            remaining: None,
             encrypted: BytesMut::new(),
             disabled: false,
         }
@@ -58,36 +62,61 @@ impl Splitter {
             encrypted.len() == plain.len(),
             "ciphertext/plaintext length mismatch"
         );
-        if encrypted.is_empty() {
-            return Ok(Vec::new());
-        }
-        if self.disabled {
-            return Ok(vec![Bytes::copy_from_slice(encrypted)]);
-        }
-        self.plain.extend_from_slice(plain);
-        self.encrypted.extend_from_slice(encrypted);
+        let mut offset = 0;
         let mut parts = Vec::new();
-        loop {
-            let Some((header, length, _)) = packet_length(self.protocol, &self.plain)? else {
-                break;
-            };
-            if length == 0 {
-                self.disabled = true;
-                self.plain.clear();
+        while offset < encrypted.len() {
+            if self.disabled {
+                self.encrypted.extend_from_slice(&encrypted[offset..]);
                 parts.push(self.encrypted.split().freeze());
                 break;
             }
-            if self.plain.len() < header + length {
-                break;
+            if self.remaining.is_none() {
+                let needed = if self.protocol == Protocol::Abridged
+                    && (self.header_len == 0 || self.header[0] & 0x7f != 0x7f)
+                {
+                    1
+                } else {
+                    4
+                };
+                let count = (needed - self.header_len).min(plain.len() - offset);
+                self.header[self.header_len..self.header_len + count]
+                    .copy_from_slice(&plain[offset..offset + count]);
+                self.encrypted
+                    .extend_from_slice(&encrypted[offset..offset + count]);
+                self.header_len += count;
+                offset += count;
+                let Some((_, length, _)) =
+                    packet_length(self.protocol, &self.header[..self.header_len])?
+                else {
+                    continue;
+                };
+                if length == 0 {
+                    self.disabled = true;
+                    continue;
+                }
+                self.remaining = Some(length);
             }
-            self.plain.advance(header + length);
-            parts.push(self.encrypted.split_to(header + length).freeze());
+            let remaining = self.remaining.unwrap_or(0);
+            let count = remaining.min(encrypted.len() - offset);
+            self.encrypted
+                .extend_from_slice(&encrypted[offset..offset + count]);
+            offset += count;
+            self.remaining = Some(remaining - count);
+            if count == remaining {
+                parts.push(self.encrypted.split().freeze());
+                self.header_len = 0;
+                self.remaining = None;
+            }
+        }
+        if self.disabled && !self.encrypted.is_empty() {
+            parts.push(self.encrypted.split().freeze());
         }
         Ok(parts)
     }
 
     pub fn flush(&mut self) -> Bytes {
-        self.plain.clear();
+        self.header_len = 0;
+        self.remaining = None;
         self.encrypted.split().freeze()
     }
 }

@@ -1,15 +1,21 @@
 use crate::{
     config::{Config, valid_domain},
     crypto::ClientInit,
-    h2_transport::{self, HttpLane},
+    h2_pool::{LanePool, Session},
+    h2_transport::{self, HttpLane, Settings},
     network::{Network, WebSocket},
+    performance::{self, Kind, Metrics, Route},
     pool::{Key, Pool},
     stats::Stats,
 };
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
+use futures_util::FutureExt;
 use std::{
     collections::BTreeMap,
-    sync::{Arc, atomic::Ordering::Relaxed},
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering::Relaxed},
+    },
     time::{Duration, Instant},
 };
 use tokio::{
@@ -106,14 +112,11 @@ pub enum Upstream {
     H2(Arc<HttpLane>),
 }
 
-struct LaneState {
-    lane: Option<Arc<HttpLane>>,
-    retry: Instant,
-}
-struct TcpState {
-    semaphore: Arc<Semaphore>,
-    failures: u32,
-    retry: Instant,
+pub struct Selection {
+    pub upstream: Upstream,
+    pub route: Route,
+    pub elapsed: Duration,
+    pub session: Option<Session>,
 }
 
 pub struct Routing {
@@ -122,8 +125,11 @@ pub struct Routing {
     pub stats: Arc<Stats>,
     pub pool: Arc<Pool>,
     pub domains: Mutex<Domains>,
-    lanes: Mutex<BTreeMap<String, Arc<Mutex<LaneState>>>>,
-    tcp: Mutex<BTreeMap<(u16, bool), TcpState>>,
+    pub metrics: Arc<Metrics>,
+    lanes: LanePool,
+    memory: Arc<Semaphore>,
+    selections: AtomicU64,
+    handshakes: Semaphore,
 }
 
 impl Routing {
@@ -134,162 +140,231 @@ impl Routing {
             config,
             network,
             stats,
-            lanes: Mutex::new(BTreeMap::new()),
-            tcp: Mutex::new(BTreeMap::new()),
+            metrics: Arc::new(Metrics::default()),
+            lanes: LanePool::default(),
+            memory: Arc::new(Semaphore::new(32 * 1024 * 1024)),
+            selections: AtomicU64::new(0),
+            handshakes: Semaphore::new(8),
         })
     }
 
-    pub async fn choose(&self, init: &ClientInit) -> Result<Upstream> {
-        let dc = init.dc;
+    pub async fn choose(&self, init: &ClientInit) -> Result<Selection> {
+        let mut candidates = Vec::new();
+        let mut domain_order = Vec::new();
+        let route = |kind, endpoint: String| Route {
+            dc: init.dc,
+            media: init.media,
+            test: init.test,
+            kind,
+            endpoint,
+        };
         if self.config.pool_size > 0
-            && let Some(socket) = self.pool.take(Key::Direct(dc, init.media, init.test)).await
+            && crate::config::parse_dc_ips(&self.config.dc_ip)?.contains_key(&init.dc)
         {
-            self.stats.ws.fetch_add(1, Relaxed);
-            log::info!("route DC{dc} media={} -> Telegram WS", init.media);
-            return Ok(Upstream::WebSocket {
-                socket: Box::new(socket),
-                split: true,
-            });
+            candidates.push(route(Kind::Direct, "telegram".into()));
         }
-        if !self.config.worker_domains().is_empty() && dc_ip(dc, init.test).is_some() {
-            let key = Key::Worker(dc, init.test);
-            let pooled = if self.config.pool_size > 0 {
-                self.pool.take(key).await
-            } else {
-                None
-            };
-            let result = match pooled {
-                Some(socket) => Ok(socket),
-                None => self.pool.connect(key).await,
-            };
-            if let Ok(socket) = result {
-                self.stats.cf.fetch_add(1, Relaxed);
-                log::info!("route DC{dc} -> Worker WS");
-                return Ok(Upstream::WebSocket {
-                    socket: Box::new(socket),
-                    split: false,
-                });
-            }
+        if !self.config.worker_domains().is_empty() && dc_ip(init.dc, init.test).is_some() {
+            candidates.push(route(Kind::Worker, "workers".into()));
         }
         if self.config.cfproxy && !init.test {
-            let domains = self.domains.lock().await.ordered(dc);
-            if init.media && self.config.h2_enabled() {
-                match timeout(Duration::from_secs(8), self.h2_lane(dc, &domains)).await {
-                    Ok(Ok(lane)) => {
-                        self.stats.h2.fetch_add(1, Relaxed);
-                        self.stats.cf.fetch_add(1, Relaxed);
-                        log::info!("route DC{dc} media -> CF H2");
-                        return Ok(Upstream::H2(lane));
-                    }
-                    _ => log::debug!("DC{dc} H2 unavailable, trying WS"),
+            for base in self
+                .domains
+                .lock()
+                .await
+                .ordered(init.dc)
+                .into_iter()
+                .take(12)
+            {
+                let host = format!("kws{}.{}", init.dc, base);
+                domain_order.push(host.clone());
+                if init.media && self.config.h2_enabled() {
+                    candidates.push(route(Kind::H2, host.clone()));
                 }
+                candidates.push(route(Kind::WebSocket, host));
             }
-            for base in domains {
-                let domain = format!("kws{dc}.{base}");
-                match self
-                    .network
-                    .websocket(&domain, &domain, "/apiws", !self.config.no_secure, false)
-                    .await
-                {
-                    Ok(socket) => {
-                        self.domains.lock().await.prefer(dc, &base);
-                        self.stats.cf.fetch_add(1, Relaxed);
-                        log::info!("route DC{dc} -> CF WS");
-                        return Ok(Upstream::WebSocket {
-                            socket: Box::new(socket),
-                            split: true,
-                        });
+        }
+        if let Some(ip) = dc_ip(init.dc, init.test) {
+            candidates.push(route(Kind::Tcp, ip.into()));
+        }
+        let mut candidates: Vec<_> = candidates
+            .into_iter()
+            .filter_map(|route| {
+                let score = self.metrics.score(&route)?;
+                let offset = if self.metrics.known(&route) {
+                    0
+                } else {
+                    domain_order
+                        .iter()
+                        .position(|host| *host == route.endpoint)
+                        .unwrap_or(0) as u64
+                        * 200
+                };
+                Some((score.saturating_add(offset), route))
+            })
+            .collect();
+        candidates.sort_unstable_by_key(|(score, _)| *score);
+        let fallback = candidates
+            .iter()
+            .position(|(_, route)| route.kind == Kind::Tcp)
+            .map(|index| candidates.remove(index).1);
+        let sequence = self.selections.fetch_add(1, Relaxed);
+        if sequence % 16 == 15 && candidates.len() > 2 {
+            let index = 2 + (sequence as usize / 16) % (candidates.len() - 2);
+            candidates.swap(1, index);
+        }
+        let started = Instant::now();
+        let attempt = |route: Route| {
+            async move {
+                let begin = Instant::now();
+                match timeout(Duration::from_secs(8), self.connect_route(&route)).await {
+                    Ok(Ok((upstream, session))) => {
+                        self.metrics.connected(&route, begin.elapsed());
+                        Ok(Selection {
+                            upstream,
+                            route,
+                            elapsed: started.elapsed(),
+                            session,
+                        })
                     }
-                    Err(error) => {
+                    result => {
+                        self.metrics.failed(&route);
                         self.stats.errors.fetch_add(1, Relaxed);
-                        log::debug!("CF WS DC{dc}: {error}");
+                        match result {
+                            Ok(Err(error)) => Err(error),
+                            _ => anyhow::bail!("route connection timeout"),
+                        }
                     }
                 }
             }
-        }
-        let ip = dc_ip(dc, init.test).context("no fallback IP for this DC")?;
-        let semaphore = {
-            let mut states = self.tcp.lock().await;
-            let state = states.entry((dc, init.test)).or_insert_with(|| TcpState {
-                semaphore: Arc::new(Semaphore::new(1)),
-                failures: 0,
-                retry: Instant::now(),
-            });
-            if Instant::now() < state.retry {
-                bail!("TCP route in backoff for DC{dc}");
-            }
-            state.semaphore.clone()
+            .boxed()
         };
-        let _lease = semaphore
-            .try_acquire()
-            .context("TCP route is already connecting")?;
-        match self.network.tcp(ip, 443).await {
-            Ok(stream) => {
-                if let Some(state) = self.tcp.lock().await.get_mut(&(dc, init.test)) {
-                    state.failures = 0;
-                    state.retry = Instant::now();
-                }
-                self.stats.tcp.fetch_add(1, Relaxed);
-                log::info!("route DC{dc} test={} -> TCP", init.test);
-                Ok(Upstream::Tcp(stream))
+        let selection = timeout(Duration::from_secs(16), async {
+            match performance::race(
+                candidates.into_iter().map(|(_, route)| attempt(route)),
+                Duration::from_millis(200),
+            )
+            .await
+            {
+                Ok(selection) => Ok(selection),
+                Err(error) => match fallback {
+                    Some(route) => attempt(route).await,
+                    None => Err(error),
+                },
             }
-            Err(error) => {
-                if let Some(state) = self.tcp.lock().await.get_mut(&(dc, init.test)) {
-                    state.failures = (state.failures + 1).min(8);
-                    state.retry = Instant::now()
-                        + Duration::from_secs((30u64 << (state.failures - 1)).min(3600));
-                }
-                Err(error)
+        })
+        .await
+        .context("route selection timed out")??;
+        if matches!(selection.route.kind, Kind::H2 | Kind::WebSocket)
+            && let Some((_, base)) = selection.route.endpoint.split_once('.')
+        {
+            self.domains.lock().await.prefer(init.dc, base);
+        }
+        match selection.route.kind {
+            Kind::Direct => {
+                self.stats.ws.fetch_add(1, Relaxed);
+            }
+            Kind::H2 => {
+                self.stats.h2.fetch_add(1, Relaxed);
+                self.stats.cf.fetch_add(1, Relaxed);
+            }
+            Kind::Worker | Kind::WebSocket => {
+                self.stats.cf.fetch_add(1, Relaxed);
+            }
+            Kind::Tcp => {
+                self.stats.tcp.fetch_add(1, Relaxed);
             }
         }
+        log::info!(
+            "route DC{} media={} -> {} connect={}ms",
+            init.dc,
+            init.media,
+            selection.route.kind.name(),
+            selection.elapsed.as_millis()
+        );
+        Ok(selection)
     }
 
-    async fn h2_lane(&self, dc: u16, domains: &[String]) -> Result<Arc<HttpLane>> {
-        for base in domains {
-            let host = format!("kws{dc}.{base}");
-            let state = {
-                let mut lanes = self.lanes.lock().await;
-                lanes
-                    .entry(host.clone())
-                    .or_insert_with(|| {
-                        Arc::new(Mutex::new(LaneState {
-                            lane: None,
-                            retry: Instant::now(),
-                        }))
+    async fn connect_route(&self, route: &Route) -> Result<(Upstream, Option<Session>)> {
+        let _permit = self.handshakes.acquire().await?;
+        let upstream = match route.kind {
+            Kind::Direct | Kind::Worker => {
+                let key = if route.kind == Kind::Direct {
+                    Key::Direct(route.dc, route.media, route.test)
+                } else {
+                    Key::Worker(route.dc, route.test)
+                };
+                let socket = if self.config.pool_size > 0 {
+                    self.pool.take(key).await
+                } else {
+                    None
+                };
+                let socket = match socket {
+                    Some(socket) => socket,
+                    None => self.pool.connect(key).await?,
+                };
+                Upstream::WebSocket {
+                    socket: Box::new(socket),
+                    split: route.kind == Kind::Direct,
+                }
+            }
+            Kind::WebSocket => Upstream::WebSocket {
+                socket: Box::new(
+                    self.network
+                        .websocket(
+                            &route.endpoint,
+                            &route.endpoint,
+                            "/apiws",
+                            !self.config.no_secure,
+                            false,
+                        )
+                        .await?,
+                ),
+                split: true,
+            },
+            Kind::Tcp => Upstream::Tcp(self.network.tcp(&route.endpoint, 443).await?),
+            Kind::H2 => {
+                let session = self
+                    .lanes
+                    .acquire(&route.endpoint, self.config.h2_max_connections, || async {
+                        let stream = self.network.h2_stream(&route.endpoint).await?;
+                        let settings = Settings {
+                            stream_window: (self.config.h2_stream_window_kb * 1024) as u32,
+                            connection_window: (self.config.h2_connection_window_kb * 1024) as u32,
+                        };
+                        let lane = HttpLane::with_settings(
+                            stream,
+                            &route.endpoint,
+                            self.stats.clone(),
+                            settings,
+                            self.memory.clone(),
+                        )
+                        .await?;
+                        lane.preflight().await?;
+                        self.stats.h2_connections.fetch_add(1, Relaxed);
+                        Ok(lane)
                     })
-                    .clone()
-            };
-            let mut state = state.lock().await;
-            if Instant::now() < state.retry {
-                continue;
+                    .await?;
+                return Ok((Upstream::H2(session.0.clone()), Some(session)));
             }
-            if let Some(lane) = &state.lane {
-                return Ok(lane.clone());
-            }
-            match HttpLane::connect(&self.network, &host, self.stats.clone()).await {
-                Ok(lane) => match lane.preflight().await {
-                    Ok(()) => {
-                        state.lane = Some(lane.clone());
-                        self.domains.lock().await.prefer(dc, base);
-                        return Ok(lane);
-                    }
-                    Err(error) => log::debug!("H2 preflight: {error}"),
-                },
-                Err(error) => log::debug!("H2 connect: {error}"),
-            }
-            state.retry = Instant::now() + Duration::from_secs(30);
-        }
-        bail!("no available H2 route")
+        };
+        Ok((upstream, None))
     }
 
     pub async fn invalidate_h2(&self, lane: &Arc<HttpLane>) {
-        let states: Vec<_> = self.lanes.lock().await.values().cloned().collect();
-        for state in states {
-            let mut state = state.lock().await;
-            if state.lane.as_ref().is_some_and(|v| Arc::ptr_eq(v, lane)) {
-                state.lane = None;
-                state.retry = Instant::now() + Duration::from_secs(30);
-            }
+        if lane.closed() {
+            self.lanes.invalidate(lane);
+        }
+    }
+
+    pub fn report(&self) -> Vec<String> {
+        self.metrics.report()
+    }
+
+    pub async fn maintain(self: Arc<Self>) {
+        let mut tick = tokio::time::interval(Duration::from_secs(30));
+        loop {
+            tick.tick().await;
+            self.lanes.prune();
         }
     }
 

@@ -13,7 +13,10 @@ use std::{
     },
     time::{Duration, Instant},
 };
-use tokio::{sync::Mutex, task::JoinSet};
+use tokio::{
+    sync::{Mutex, Notify},
+    task::JoinSet,
+};
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum Key {
@@ -23,9 +26,27 @@ pub enum Key {
 
 struct Bucket {
     idle: VecDeque<(WebSocket, Instant)>,
-    filling: bool,
+    filling: usize,
+    used: Instant,
+    demand: usize,
     failures: u32,
     retry: Instant,
+}
+
+impl Bucket {
+    fn target(&mut self, limit: usize) -> usize {
+        self.idle
+            .retain(|(_, created)| created.elapsed() < Duration::from_secs(100));
+        if self.used.elapsed() >= Duration::from_secs(30) {
+            self.demand = 1;
+            self.idle.truncate(1);
+        }
+        if self.used.elapsed() >= Duration::from_secs(120) {
+            self.demand = 0;
+            self.idle.clear();
+        }
+        self.demand.min(limit)
+    }
 }
 
 pub struct Pool {
@@ -34,6 +55,7 @@ pub struct Pool {
     network: Arc<Network>,
     stats: Arc<Stats>,
     fronting_first: AtomicBool,
+    wake: Notify,
 }
 
 pub fn ws_domains(dc: u16, media: bool) -> Vec<String> {
@@ -54,6 +76,7 @@ impl Pool {
             network,
             stats,
             fronting_first: AtomicBool::new(false),
+            wake: Notify::new(),
         })
     }
 
@@ -61,10 +84,15 @@ impl Pool {
         let mut buckets = self.buckets.lock().await;
         let bucket = buckets.entry(key).or_insert_with(|| Bucket {
             idle: VecDeque::new(),
-            filling: false,
+            filling: 0,
+            used: Instant::now(),
+            demand: 1,
             failures: 0,
             retry: Instant::now(),
         });
+        bucket.used = Instant::now();
+        bucket.demand = (bucket.demand + 1).min(self.config.pool_size);
+        self.wake.notify_one();
         while let Some((mut socket, created)) = bucket.idle.pop_front() {
             if created.elapsed() >= Duration::from_secs(100) {
                 continue;
@@ -132,41 +160,141 @@ impl Pool {
     }
 
     pub async fn maintain(self: Arc<Self>) {
-        let mut jobs = JoinSet::new();
-        let mut tick = tokio::time::interval(Duration::from_secs(1));
-        loop {
-            tokio::select! {
-                _ = tick.tick() => {
-                    if self.config.pool_size == 0 { continue; }
-                    let Ok(redirects) = parse_dc_ips(&self.config.dc_ip) else { return; };
-                    let mut keys = Vec::new();
-                    for dc in redirects.keys() { for media in [false, true] { keys.push(Key::Direct(*dc, media, self.config.force_test_dc)); } }
-                    if !self.config.worker_domains().is_empty() { for dc in [1,2,3,4,5,203] { if !redirects.contains_key(&dc) && (!self.config.force_test_dc || dc <= 3) { keys.push(Key::Worker(dc, self.config.force_test_dc)); } } }
-                    let mut buckets = self.buckets.lock().await;
-                    for key in keys {
-                        let bucket = buckets.entry(key).or_insert_with(|| Bucket { idle: VecDeque::new(), filling: false, failures: 0, retry: Instant::now() });
-                        bucket.idle.retain(|(_, created)| created.elapsed() < Duration::from_secs(100));
-                        let target = if matches!(key, Key::Worker(..)) { 1 } else { self.config.pool_size };
-                        if bucket.filling || bucket.idle.len() >= target || Instant::now() < bucket.retry { continue; }
-                        bucket.filling = true;
-                        let count = target - bucket.idle.len();
-                        let pool = self.clone();
-                        jobs.spawn(async move {
-                            let mut connects = JoinSet::new();
-                            for _ in 0..count { let pool = pool.clone(); connects.spawn(async move { pool.connect(key).await }); }
-                            let mut ready = VecDeque::new();
-                            while let Some(result) = connects.join_next().await { if let Ok(Ok(socket)) = result { ready.push_back((socket, Instant::now())); } }
-                            let mut buckets = pool.buckets.lock().await;
-                            if let Some(bucket) = buckets.get_mut(&key) {
-                                bucket.filling = false;
-                                if ready.is_empty() { bucket.failures = (bucket.failures + 1).min(13); bucket.retry = Instant::now() + Duration::from_secs((1u64 << (bucket.failures - 1)).min(3600)); }
-                                else { bucket.failures = 0; bucket.idle.extend(ready); }
-                            }
-                        });
+        if self.config.pool_size == 0 {
+            return;
+        }
+        let Ok(redirects) = parse_dc_ips(&self.config.dc_ip) else {
+            return;
+        };
+        {
+            let mut buckets = self.buckets.lock().await;
+            let mut keys = Vec::new();
+            for dc in redirects.keys() {
+                for media in [false, true] {
+                    keys.push(Key::Direct(*dc, media, self.config.force_test_dc));
+                }
+            }
+            if !self.config.worker_domains().is_empty() {
+                for dc in [1, 2, 3, 4, 5, 203] {
+                    if !redirects.contains_key(&dc) && (!self.config.force_test_dc || dc <= 3) {
+                        keys.push(Key::Worker(dc, self.config.force_test_dc));
                     }
                 }
-                Some(result) = jobs.join_next(), if !jobs.is_empty() => { if let Err(error) = result { log::error!("pool task failed: {error}"); } }
+            }
+            for key in keys {
+                buckets.entry(key).or_insert_with(|| Bucket {
+                    idle: VecDeque::new(),
+                    filling: 0,
+                    failures: 0,
+                    retry: Instant::now(),
+                    used: Instant::now(),
+                    demand: 1,
+                });
             }
         }
+        let mut jobs = JoinSet::new();
+        let mut tick = tokio::time::interval(Duration::from_secs(15));
+        loop {
+            {
+                let mut buckets = self.buckets.lock().await;
+                for (key, bucket) in buckets.iter_mut() {
+                    let target = bucket.target(self.config.pool_size);
+                    while jobs.len() < 4
+                        && bucket.idle.len() + bucket.filling < target
+                        && Instant::now() >= bucket.retry
+                    {
+                        bucket.filling += 1;
+                        let pool = self.clone();
+                        let key = *key;
+                        jobs.spawn(async move { (key, pool.connect(key).await) });
+                    }
+                }
+            }
+            tokio::select! {
+                _ = tick.tick() => {},
+                _ = self.wake.notified() => {},
+                Some(result) = jobs.join_next(), if !jobs.is_empty() => {
+                    match result {
+                        Ok((key, result)) => self.completed(key, result).await,
+                        Err(error) => log::error!("pool task failed: {error}"),
+                    }
+                }
+            }
+        }
+    }
+
+    async fn completed(&self, key: Key, result: Result<WebSocket>) {
+        let mut buckets = self.buckets.lock().await;
+        if let Some(bucket) = buckets.get_mut(&key) {
+            bucket.filling = bucket.filling.saturating_sub(1);
+            match result {
+                Ok(socket) => {
+                    bucket.failures = 0;
+                    bucket.retry = Instant::now();
+                    bucket.idle.push_back((socket, Instant::now()));
+                }
+                Err(_) => {
+                    bucket.failures = (bucket.failures + 1).min(13);
+                    bucket.retry = Instant::now()
+                        + Duration::from_secs((1u64 << (bucket.failures - 1)).min(3600));
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio_tungstenite::{WebSocketStream, tungstenite::protocol::Role};
+
+    #[tokio::test]
+    async fn ready_socket_is_available_while_another_connection_is_still_pending() {
+        let config = Arc::new(Config::fresh().unwrap());
+        let pool = Pool::new(
+            config,
+            Network::new(4096).unwrap(),
+            Arc::new(Stats::default()),
+        );
+        let key = Key::Direct(2, true, false);
+        assert!(pool.take(key).await.is_none());
+        {
+            let mut buckets = pool.buckets.lock().await;
+            buckets.get_mut(&key).unwrap().filling = 2;
+        }
+        let (stream, _peer) = tokio::io::duplex(1024);
+        let socket = WebSocketStream::from_raw_socket(
+            Box::new(stream) as crate::network::Stream,
+            Role::Client,
+            None,
+        )
+        .await;
+        pool.completed(key, Ok(socket)).await;
+        assert!(pool.take(key).await.is_some());
+        assert_eq!(pool.buckets.lock().await[&key].filling, 1);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), pool.wake.notified())
+                .await
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn warm_pool_grows_on_demand_and_stops_reconnecting_when_idle() {
+        let mut bucket = Bucket {
+            idle: VecDeque::new(),
+            filling: 0,
+            used: Instant::now(),
+            demand: 1,
+            failures: 0,
+            retry: Instant::now(),
+        };
+        assert_eq!(bucket.target(4), 1);
+        bucket.demand = 4;
+        assert_eq!(bucket.target(4), 4);
+        bucket.used = Instant::now() - Duration::from_secs(31);
+        assert_eq!(bucket.target(4), 1);
+        bucket.used = Instant::now() - Duration::from_secs(121);
+        assert_eq!(bucket.target(4), 0);
     }
 }
