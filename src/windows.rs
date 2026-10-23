@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, bail, ensure};
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     ffi::OsStr,
     mem::{size_of, zeroed},
     os::windows::ffi::OsStrExt,
@@ -195,8 +195,8 @@ enum Event {
     Error(String),
     Status(String),
     Message(String),
-    Update(updates::Release),
-    Install(PathBuf),
+    UpdateChecked(std::result::Result<updates::Release, String>, bool),
+    Install(std::result::Result<tg_ws_proxy_plus::update_install::Prepared, String>),
 }
 enum Kind {
     Text,
@@ -231,7 +231,9 @@ struct Ui {
     page: usize,
     dpi: i32,
     font: HFONT,
-    pending_update: Option<PathBuf>,
+    update_busy: Cell<bool>,
+    update_ready: Option<PathBuf>,
+    prompted_version: Option<String>,
 }
 
 impl Ui {
@@ -646,22 +648,14 @@ impl Ui {
             Kind::Check,
         )?;
         self.field(
-            "update_repository",
-            "GitHub Rust-проекта: owner/repo",
-            "Rust project GitHub: owner/repo",
-            2,
-            6,
-            Kind::Text,
-        )?;
-        self.field(
             "language",
             "Язык интерфейса",
             "Interface language",
             2,
-            7,
+            6,
             Kind::Choice,
         )?;
-        self.field("appearance", "Оформление", "Appearance", 2, 8, Kind::Choice)?;
+        self.field("appearance", "Оформление", "Appearance", 2, 7, Kind::Choice)?;
         self.field(
             "h2_max_connections",
             "H2-соединений на сервер",
@@ -843,6 +837,9 @@ impl Ui {
     }
 
     fn background(&self, update: bool, manual: bool) -> Result<()> {
+        if update && self.update_busy.replace(true) {
+            return Ok(());
+        }
         let config = self.config.clone();
         let live = self
             .proxy
@@ -855,7 +852,7 @@ impl Ui {
             .unwrap_or_default();
         let tx = self.sender.clone();
         let hwnd = self.hwnd as usize;
-        thread::Builder::new()
+        let spawned = thread::Builder::new()
             .name(if update { "updates" } else { "diagnostics" }.into())
             .spawn(move || {
                 let result = (|| -> Result<Event> {
@@ -864,22 +861,11 @@ impl Ui {
                         .build()?;
                     runtime.block_on(async {
                         if update {
-                            let network = Network::new(config.buf_kb * 1024)?;
-                            let release =
-                                updates::check(&network, &config.update_repository).await?;
-                            if updates::newer(&release.tag_name, tg_ws_proxy_plus::VERSION)? {
-                                Ok(Event::Update(release))
-                            } else {
-                                Ok(Event::Message(if manual {
-                                    format!(
-                                        "TgWsProxyPlus {}\nGitHub: {}",
-                                        tg_ws_proxy_plus::VERSION,
-                                        release.tag_name
-                                    )
-                                } else {
-                                    String::new()
-                                }))
-                            }
+                            let network = Network::new(0)?;
+                            Ok(Event::UpdateChecked(
+                                updates::check(&network).await.map_err(|e| format!("{e:#}")),
+                                manual,
+                            ))
                         } else {
                             let mut report = live;
                             report.push("--- Connection probes ---".into());
@@ -888,15 +874,19 @@ impl Ui {
                         }
                     })
                 })();
-                Self::post(
-                    &tx,
-                    hwnd,
-                    match result {
-                        Ok(event) => event,
-                        Err(error) => Event::Error(format!("{error:#}")),
-                    },
-                );
-            })?;
+                let event = match result {
+                    Ok(event) => event,
+                    Err(error) if update => Event::UpdateChecked(Err(format!("{error:#}")), manual),
+                    Err(error) => Event::Error(format!("{error:#}")),
+                };
+                Self::post(&tx, hwnd, event);
+            });
+        if let Err(error) = spawned {
+            if update {
+                self.update_busy.set(false);
+            }
+            return Err(error.into());
+        }
         Ok(())
     }
 
@@ -1006,38 +996,42 @@ impl Ui {
     }
 
     fn download_update(&self, release: updates::Release) -> Result<()> {
-        let expected =
-            updates::asset_name().context("updates are not available for this platform")?;
-        let asset = release
-            .assets
-            .into_iter()
-            .find(|asset| asset.name == expected)
-            .context("release has no matching Rust executable for this platform")?;
+        let asset = updates::select_asset(&release)?.clone();
+        let digest = asset.digest.clone().context("missing update digest")?;
         let directory = std::env::current_exe()?
             .parent()
             .context("executable has no parent")?
             .to_path_buf();
+        if self.update_busy.replace(true) {
+            return Ok(());
+        }
         let tx = self.sender.clone();
         let hwnd = self.hwnd as usize;
-        thread::Builder::new()
+        let spawned = thread::Builder::new()
             .name("update-download".into())
             .spawn(move || {
-                let result = (|| -> Result<PathBuf> {
+                let result = (|| -> Result<tg_ws_proxy_plus::update_install::Prepared> {
                     let runtime = tokio::runtime::Builder::new_current_thread()
                         .enable_all()
                         .build()?;
-                    let network = Network::new(64 * 1024)?;
-                    runtime.block_on(updates::download(&network, &asset, &directory))
+                    let network = Network::new(0)?;
+                    let path = runtime.block_on(updates::download(&network, &asset, &directory))?;
+                    Ok(tg_ws_proxy_plus::update_install::Prepared {
+                        path,
+                        digest,
+                        version: release.tag_name,
+                    })
                 })();
                 Self::post(
                     &tx,
                     hwnd,
-                    match result {
-                        Ok(path) => Event::Install(path),
-                        Err(error) => Event::Error(format!("{error:#}")),
-                    },
+                    Event::Install(result.map_err(|e| format!("{e:#}"))),
                 );
-            })?;
+            });
+        if let Err(error) = spawned {
+            self.update_busy.set(false);
+            return Err(error.into());
+        }
         set_text(
             self.status,
             self.tr(
@@ -1051,6 +1045,11 @@ impl Ui {
 
 unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESULT {
     unsafe {
+        if msg == WM_CLOSE || (msg == WM_SYSCOMMAND && w & 0xfff0 == SC_CLOSE as usize) {
+            ShowWindow(hwnd, SW_HIDE);
+            PostMessageW(hwnd, WM_COMMAND, CANCEL, 0);
+            return 0;
+        }
         if msg == WM_NCCREATE {
             let creation = &*(l as *const CREATESTRUCTW);
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, creation.lpCreateParams as isize);
@@ -1067,9 +1066,11 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
             return DefWindowProcW(hwnd, msg, w, l);
         };
         match msg {
-            WM_CLOSE => {
-                if let Err(error) = ui.command(CANCEL) {
-                    show_error(&error.to_string());
+            WM_TIMER if w == 1001 => {
+                if ui.config.check_updates
+                    && let Err(error) = ui.background(true, false)
+                {
+                    log::warn!("update worker: {error:#}");
                 }
                 return 0;
             }
@@ -1134,42 +1135,100 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
                             log::error!("{error}");
                             message(hwnd, &error, "TgWsProxy+", MB_OK | MB_ICONERROR);
                         }
-                        Event::Status(status) => set_text(
-                            ui.status,
-                            &format!(
-                                "{}  {status}",
-                                ui.tr("Прокси работает:", "Proxy listening:")
-                            ),
-                        ),
+                        Event::Status(status) => {
+                            set_text(
+                                ui.status,
+                                &format!(
+                                    "{}  {status}",
+                                    ui.tr("Прокси работает:", "Proxy listening:")
+                                ),
+                            );
+                            if let Some(path) = ui.update_ready.take()
+                                && let Err(error) =
+                                    tg_ws_proxy_plus::update_install::confirm_ready(&path)
+                            {
+                                log::error!("cannot confirm update startup: {error:#}");
+                                PostQuitMessage(1);
+                            }
+                        }
                         Event::Message(text) => {
                             if !text.is_empty() {
                                 message(hwnd, &text, "TgWsProxy+", MB_OK | MB_ICONINFORMATION);
                             }
                         }
-                        Event::Update(release) => {
-                            if message(
-                                hwnd,
-                                &format!(
-                                    "{} {}\n{}",
-                                    ui.tr("Доступна версия", "Version available:"),
-                                    release.tag_name,
-                                    ui.tr(
-                                        "Скачать, проверить SHA-256 и установить?",
-                                        "Download, verify SHA-256 and install?"
+                        Event::UpdateChecked(result, manual) => {
+                            ui.update_busy.set(false);
+                            match result {
+                                Ok(release) => {
+                                    let is_new = updates::newer(
+                                        &release.tag_name,
+                                        tg_ws_proxy_plus::VERSION,
                                     )
-                                ),
-                                "TgWsProxy+",
-                                MB_YESNO | MB_ICONINFORMATION,
-                            ) == IDYES
-                                && let Err(error) = ui.download_update(release)
-                            {
-                                show_error(&error.to_string());
+                                    .unwrap_or(false);
+                                    if is_new
+                                        && (manual
+                                            || ui.prompted_version.as_ref()
+                                                != Some(&release.tag_name))
+                                    {
+                                        ui.prompted_version = Some(release.tag_name.clone());
+                                        if message(
+                                            hwnd,
+                                            &format!(
+                                                "{} {}\n{}",
+                                                ui.tr("Доступна версия", "Version available:"),
+                                                release.tag_name,
+                                                ui.tr(
+                                                    "Скачать и установить обновление?",
+                                                    "Download and install the update?"
+                                                )
+                                            ),
+                                            "TgWsProxy+",
+                                            MB_YESNO | MB_ICONINFORMATION,
+                                        ) == IDYES
+                                            && let Err(error) = ui.download_update(release)
+                                        {
+                                            show_error(&format!("{error:#}"));
+                                        }
+                                    } else if manual && !is_new {
+                                        message(
+                                            hwnd,
+                                            ui.tr(
+                                                "Установлена актуальная версия.",
+                                                "The application is up to date.",
+                                            ),
+                                            "TgWsProxy+",
+                                            MB_OK | MB_ICONINFORMATION,
+                                        );
+                                    }
+                                }
+                                Err(error) => {
+                                    log::warn!("update check failed: {error}");
+                                    if manual {
+                                        message(hwnd, &error, "TgWsProxy+", MB_OK | MB_ICONERROR);
+                                    }
+                                }
                             }
                         }
-                        Event::Install(path) => {
-                            ui.pending_update = Some(path);
-                            ui.proxy.take();
-                            PostQuitMessage(0);
+                        Event::Install(result) => {
+                            ui.update_busy.set(false);
+                            let result = result.map_err(anyhow::Error::msg).and_then(|prepared| {
+                                tg_ws_proxy_plus::update_install::handoff(prepared, &ui.path)
+                            });
+                            match result {
+                                Ok(()) => {
+                                    ui.proxy.take();
+                                    PostQuitMessage(0);
+                                }
+                                Err(error) => {
+                                    log::error!("update installation failed: {error:#}");
+                                    message(
+                                        hwnd,
+                                        &format!("{error:#}"),
+                                        "TgWsProxy+",
+                                        MB_OK | MB_ICONERROR,
+                                    );
+                                }
+                            }
                         }
                     }
                 }
@@ -1189,11 +1248,17 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
             }
             _ => {}
         }
+        drop(ui);
         DefWindowProcW(hwnd, msg, w, l)
     }
 }
 
-pub fn run(config: Config, path: PathBuf, first_run: bool) -> Result<()> {
+pub fn run(
+    config: Config,
+    path: PathBuf,
+    first_run: bool,
+    update_ready: Option<PathBuf>,
+) -> Result<()> {
     let first_run_marker = path.with_file_name(".first-run-done");
     let first_run = first_run || !first_run_marker.exists();
     unsafe {
@@ -1288,7 +1353,9 @@ pub fn run(config: Config, path: PathBuf, first_run: bool) -> Result<()> {
             page: 0,
             dpi,
             font,
-            pending_update: None,
+            update_busy: Cell::new(false),
+            update_ready,
+            prompted_version: None,
         }));
         let hwnd = CreateWindowExW(
             WS_EX_APPWINDOW,
@@ -1338,8 +1405,13 @@ pub fn run(config: Config, path: PathBuf, first_run: bool) -> Result<()> {
             SetForegroundWindow(hwnd);
             std::fs::write(&first_run_marker, b"TgWsProxyPlus\n")?;
         }
-        if ui.borrow().config.check_updates && !ui.borrow().config.update_repository.is_empty() {
-            ui.borrow().background(true, false)?;
+        if SetTimer(hwnd, 1001, 6 * 60 * 60 * 1000, None) == 0 {
+            log::warn!("cannot schedule periodic update checks");
+        }
+        if ui.borrow().config.check_updates
+            && let Err(error) = ui.borrow().background(true, false)
+        {
+            log::warn!("update worker: {error:#}");
         }
         let mut message: MSG = zeroed();
         loop {
@@ -1355,6 +1427,7 @@ pub fn run(config: Config, path: PathBuf, first_run: bool) -> Result<()> {
                 DispatchMessageW(&message);
             }
         }
+        KillTimer(hwnd, 1001);
         ui.borrow_mut().proxy.take();
         Shell_NotifyIconW(NIM_DELETE, &tray);
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
@@ -1366,23 +1439,86 @@ pub fn run(config: Config, path: PathBuf, first_run: bool) -> Result<()> {
         DestroyIcon(state.icon);
         DeleteObject(state.brush);
         DeleteObject(state.font);
-        let staged = state.pending_update.clone();
-        let config_path = state.path.clone();
         drop(state);
         drop(_instance);
-        if let Some(staged) = staged {
-            let exe = std::env::current_exe()?;
-            updates::replace_binary(&staged, &exe, || {
-                use std::os::windows::process::CommandExt;
-                std::process::Command::new(&exe)
-                    .arg("--tray")
-                    .arg("--config")
-                    .arg(&config_path)
-                    .creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP)
-                    .spawn()?;
-                Ok(())
-            })?;
-        }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn closing_settings_hides_window_even_during_reentrant_dispatch() {
+        unsafe {
+            let class = wide(format!("TgWsProxyPlusCloseTest{}", std::process::id()));
+            let module = GetModuleHandleW(null());
+            let wc = WNDCLASSW {
+                lpfnWndProc: Some(window_proc),
+                hInstance: module,
+                lpszClassName: class.as_ptr(),
+                ..zeroed()
+            };
+            assert_ne!(RegisterClassW(&wc), 0);
+            let (sender, receiver) = mpsc::channel();
+            let ui = RefCell::new(Ui {
+                hwnd: null_mut(),
+                config: Config::fresh().unwrap(),
+                path: PathBuf::new(),
+                proxy: None,
+                fields: Vec::new(),
+                labels: Vec::new(),
+                status: null_mut(),
+                sender,
+                receiver,
+                menu: null_mut(),
+                icon: null_mut(),
+                brush: null_mut(),
+                dark: false,
+                page: 0,
+                dpi: 96,
+                font: null_mut(),
+                update_busy: Cell::new(false),
+                update_ready: None,
+                prompted_version: None,
+            });
+            let hwnd = CreateWindowExW(
+                0,
+                class.as_ptr(),
+                class.as_ptr(),
+                WS_OVERLAPPEDWINDOW,
+                -32000,
+                -32000,
+                100,
+                100,
+                null_mut(),
+                null_mut(),
+                module,
+                (&ui as *const RefCell<Ui>).cast(),
+            );
+            assert!(!hwnd.is_null());
+            ui.borrow_mut().hwnd = hwnd;
+            for borrowed in [false, true] {
+                for (message, parameter) in [(WM_SYSCOMMAND, SC_CLOSE as usize), (WM_CLOSE, 0)] {
+                    ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+                    assert_ne!(IsWindowVisible(hwnd), 0);
+                    let held = borrowed.then(|| ui.borrow_mut());
+                    SendMessageW(hwnd, message, parameter, 0);
+                    assert_ne!(IsWindow(hwnd), 0);
+                    assert_eq!(IsWindowVisible(hwnd), 0);
+                    drop(held);
+                    let mut msg: MSG = zeroed();
+                    while PeekMessageW(&mut msg, hwnd, 0, 0, PM_REMOVE) != 0 {
+                        DispatchMessageW(&msg);
+                    }
+                }
+            }
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+            DestroyWindow(hwnd);
+            let mut msg: MSG = zeroed();
+            PeekMessageW(&mut msg, null_mut(), WM_QUIT, WM_QUIT, PM_REMOVE);
+            UnregisterClassW(class.as_ptr(), module);
+        }
     }
 }

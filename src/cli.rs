@@ -19,7 +19,7 @@ Usage: TgWsProxyPlus [--console | --tray | --settings] [options]\n\
   --link                 Print the Telegram connection link and exit\n\
   --check-config         Validate configuration and exit\n\
   --diagnose             Check configured upstream routes and exit\n\
-  --check-updates        Check update_repository from the configuration\n\
+  --check-updates        Check official TgWsProxyPlus releases\n\
   --version --help\n\
 Windows defaults to the native tray; other systems default to console.\n";
 
@@ -38,6 +38,7 @@ pub struct Args {
     pub version: bool,
     pub settings: bool,
     pub portable: bool,
+    pub update_ready: Option<PathBuf>,
     overrides: Vec<(String, String)>,
 }
 
@@ -60,7 +61,7 @@ impl Args {
                 "--check-updates" => result.updates = true,
                 "--help" | "-h" => result.help = true,
                 "--version" | "-V" => result.version = true,
-                "--config" | "--init-config" | "--log-file" => {
+                "--config" | "--init-config" | "--log-file" | "--update-ready" => {
                     let path = PathBuf::from(
                         args.next()
                             .with_context(|| format!("missing value for {flag}"))?,
@@ -68,6 +69,7 @@ impl Args {
                     match flag.as_str() {
                         "--config" => result.path = Some(path),
                         "--init-config" => result.init = Some(path),
+                        "--update-ready" => result.update_ready = Some(path),
                         _ => result.log = Some(path),
                     }
                 }

@@ -34,6 +34,9 @@ jobs:
       - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo test --locked --all-targets
       - run: cargo test --locked --all-targets --no-default-features
+      - name: Test Windows update installation and rollback
+        if: runner.os == 'Windows'
+        run: python tests/update_install.py
       - run: cargo build --release --locked
       - name: Prepare package
         shell: pwsh

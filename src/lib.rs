@@ -13,6 +13,8 @@ pub mod pool;
 pub mod routing;
 pub mod server;
 pub mod stats;
+pub mod update_http;
+pub mod update_install;
 pub mod updates;
 
 pub const NAME: &str = "TgWsProxy+";

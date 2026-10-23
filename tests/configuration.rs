@@ -179,8 +179,7 @@ fn update_downloads_require_matching_sha256_and_use_semver() {
         .is_err()
     );
     assert!(updates::verify_download(b"abc", "").is_err());
-    assert!(updates::validate_repository("T1REI/TgWsProxyPlus").is_ok());
-    assert!(updates::validate_repository("owner/repo/../../something").is_err());
+    assert_eq!(updates::REPOSITORY, "T1REI/TgWsProxyPlus");
 }
 
 #[test]

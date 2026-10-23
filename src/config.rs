@@ -38,7 +38,6 @@ pub struct Config {
     pub log_max_mb: f64,
     pub log_backups: usize,
     pub check_updates: bool,
-    pub update_repository: String,
     pub autostart: bool,
     pub appearance: String,
     pub language: String,
@@ -73,7 +72,6 @@ impl Default for Config {
             log_max_mb: 5.0,
             log_backups: 1,
             check_updates: true,
-            update_repository: "T1REI/TgWsProxyPlus".into(),
             autostart: false,
             appearance: "auto".into(),
             language: "ru".into(),
@@ -207,9 +205,6 @@ impl Config {
             ["auto", "dark", "light"].contains(&self.appearance.as_str()),
             "appearance must be auto, dark or light"
         );
-        if !self.update_repository.is_empty() {
-            crate::updates::validate_repository(&self.update_repository)?;
-        }
         Ok(())
     }
 
@@ -255,7 +250,9 @@ impl Config {
     pub fn load(path: &Path) -> Result<Self> {
         let data = fs::read(path).with_context(|| format!("cannot read {}", path.display()))?;
         ensure!(data.len() <= 1024 * 1024, "configuration exceeds 1 MiB");
-        let config: Self = serde_json::from_slice(&data).context("invalid configuration JSON")?;
+        let mut config: Self =
+            serde_json::from_slice(&data).context("invalid configuration JSON")?;
+        config.extra.remove("update_repository");
         config.validate()?;
         Ok(config)
     }

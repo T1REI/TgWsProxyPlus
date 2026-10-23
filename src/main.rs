@@ -13,6 +13,11 @@ use tg_ws_proxy_plus::{
 mod windows;
 
 fn execute() -> Result<()> {
+    #[cfg(all(windows, feature = "desktop"))]
+    if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("--apply-update")) {
+        let path = std::env::args_os().nth(2).context("missing update plan")?;
+        return tg_ws_proxy_plus::update_install::apply(std::path::Path::new(&path));
+    }
     let args = Args::parse(std::env::args().skip(1))?;
     #[cfg(all(windows, feature = "desktop"))]
     windows::attach_console();
@@ -86,7 +91,7 @@ fn execute() -> Result<()> {
     )?;
     #[cfg(all(windows, feature = "desktop"))]
     if tray {
-        return windows::run(config, path, first_run || args.settings);
+        return windows::run(config, path, first_run || args.settings, args.update_ready);
     }
     if tray {
         anyhow::bail!("native tray requires the Windows desktop build; use --console");
@@ -103,7 +108,7 @@ fn execute() -> Result<()> {
         }
         if args.updates {
             let network = Network::new(config.buf_kb * 1024)?;
-            let release = updates::check(&network, &config.update_repository).await?;
+            let release = updates::check(&network).await?;
             println!(
                 "Latest: {}\nNewer: {}\n{}",
                 release.tag_name,
@@ -141,7 +146,8 @@ fn main() {
         eprintln!("{error:#}");
         #[cfg(all(windows, feature = "desktop"))]
         if std::env::args().len() == 1
-            || std::env::args().any(|arg| arg == "--tray" || arg == "--settings")
+            || std::env::args()
+                .any(|arg| arg == "--tray" || arg == "--settings" || arg == "--apply-update")
         {
             windows::show_error(&format!("{error:#}"));
         }

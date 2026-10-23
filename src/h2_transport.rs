@@ -185,7 +185,7 @@ impl HttpLane {
             .fetch_add(waiting.elapsed().as_micros() as u64, Relaxed);
         self.stats.h2_waits.fetch_add(1, Relaxed);
         let head = method == Method::HEAD;
-        let request = Request::builder()
+        let mut request = Request::builder()
             .method(method)
             .uri(format!("https://{}{path}", self.host))
             .header("content-type", "application/octet-stream")
@@ -194,8 +194,13 @@ impl HttpLane {
                 "user-agent",
                 concat!("TgWsProxyPlus/", env!("CARGO_PKG_VERSION")),
             )
-            .header("content-length", body.len())
-            .body(())?;
+            .header("content-length", body.len());
+        if self.host == "api.github.com" {
+            request = request
+                .header("accept", "application/vnd.github+json")
+                .header("x-github-api-version", "2022-11-28");
+        }
+        let request = request.body(())?;
         let mut sender = self.sender.clone().ready().await?;
         let (response, mut send) = sender.send_request(request, body.is_empty())?;
         while !body.is_empty() {
