@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="360" viewBox="0 0 1280 360" role="img" aria-labelledby="title desc">
+  <title id="title">TgWsProxy+</title>
+  <desc id="desc">Локальный прокси для Telegram Desktop</desc>
+  <rect width="1280" height="360" rx="12" fill="#0d191d"/>
+  <text x="72" y="145" fill="#eef3f3" font-family="Segoe UI,Arial,sans-serif" font-size="68" font-weight="600" letter-spacing="-2">TgWsProxy<tspan fill="#cedddd">+</tspan></text>
+  <text x="76" y="202" fill="#9baaad" font-family="Segoe UI,Arial,sans-serif" font-size="25">Локальный прокси для Telegram Desktop</text>
+  <path d="M76 254h1128" stroke="#253337"/>
+  <text x="76" y="295" fill="#9baaad" font-family="Segoe UI,Arial,sans-serif" font-size="17">Windows · MTProto · WebSocket · HTTP/2</text>
+</svg>

@@ -30,6 +30,17 @@ jobs:
           persist-credentials: false
       - run: rustup toolchain install 1.96.0 --profile minimal --component rustfmt --component clippy
       - run: rustup override set 1.96.0
+      - uses: actions/setup-node@v7
+        if: runner.os == 'Windows'
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+      - name: Build embedded interface
+        if: runner.os == 'Windows'
+        run: |
+          npm ci --prefix ui
+          npm run build --prefix ui
       - run: cargo fmt --all -- --check
       - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo test --locked --all-targets
@@ -46,8 +57,10 @@ jobs:
         run: |
           New-Item -ItemType Directory -Path dist -Force | Out-Null
           Copy-Item -LiteralPath $env:BINARY_PATH -Destination "dist/$env:ASSET_NAME"
-          Copy-Item -LiteralPath LICENSE,LICENSE.upstream,THIRD_PARTY_NOTICES.txt,README.md -Destination dist
+          Copy-Item -LiteralPath LICENSE,LICENSE.upstream,THIRD_PARTY_NOTICES.txt,README.md,CONTRIBUTING.md -Destination dist
           Copy-Item -LiteralPath docs -Destination dist -Recurse -Force
+          New-Item -ItemType Directory -Path dist/assets -Force | Out-Null
+          Copy-Item -LiteralPath assets/brand,assets/screenshots -Destination dist/assets -Recurse -Force
           if ($IsWindows -and (Get-Item "dist/$env:ASSET_NAME").Length -gt 2MB) { throw 'EXE exceeds 2 MiB budget' }
           $hash = (Get-FileHash "dist/$env:ASSET_NAME" -Algorithm SHA256).Hash.ToLowerInvariant()
           "$hash  $env:ASSET_NAME" | Set-Content dist/SHA256SUMS.txt

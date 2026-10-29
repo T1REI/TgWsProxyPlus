@@ -60,6 +60,21 @@ struct Entry {
 #[derive(Default)]
 pub struct Metrics(Mutex<Vec<Entry>>);
 
+#[derive(serde::Serialize)]
+pub struct RouteSnapshot {
+    dc: u16,
+    media: bool,
+    kind: &'static str,
+    endpoint: String,
+    connect_ms: u64,
+    first_ms: u64,
+    active: u32,
+    errors: u64,
+    successes: u64,
+    up: u64,
+    down: u64,
+}
+
 fn average(old: u64, sample: u64) -> u64 {
     if old == 0 {
         sample
@@ -69,6 +84,29 @@ fn average(old: u64, sample: u64) -> u64 {
 }
 
 impl Metrics {
+    pub fn snapshot(&self) -> Vec<RouteSnapshot> {
+        self.0
+            .lock()
+            .map(|entries| {
+                entries
+                    .iter()
+                    .map(|e| RouteSnapshot {
+                        dc: e.route.dc,
+                        media: e.route.media,
+                        kind: e.route.kind.name(),
+                        endpoint: e.route.endpoint.clone(),
+                        connect_ms: e.connect_ms,
+                        first_ms: e.first_ms,
+                        active: e.active,
+                        errors: e.errors,
+                        successes: e.successes,
+                        up: e.up,
+                        down: e.down,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
     fn update(&self, route: &Route, action: impl FnOnce(&mut Entry)) {
         let Ok(mut entries) = self.0.lock() else {
             return;

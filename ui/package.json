@@ -1,0 +1,21 @@
+{
+  "name": "tg-ws-proxy-plus-ui",
+  "version": "0.0.2",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "astro dev --host 127.0.0.1",
+    "build": "astro check && astro build && node scripts/check-size.mjs",
+    "preview": "astro preview --host 127.0.0.1",
+    "check": "astro check"
+  },
+  "dependencies": {
+    "preact": "10.29.8"
+  },
+  "devDependencies": {
+    "@astrojs/check": "0.9.12",
+    "@astrojs/preact": "6.1.1",
+    "astro": "7.4.4",
+    "typescript": "6.0.3"
+  }
+}

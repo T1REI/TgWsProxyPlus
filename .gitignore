@@ -1,5 +1,8 @@
 /target/
 /dist/
+/ui/node_modules/
+/ui/dist/
+/ui/.astro/
 /tests/.venv/
 /tests/results/
 *.log

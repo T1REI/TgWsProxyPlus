@@ -1,0 +1,17 @@
+name: Предложить улучшение
+description: Идея, которая сделает приложение удобнее
+body:
+  - type: textarea
+    id: need
+    attributes:
+      label: Чего сейчас не хватает?
+      description: Расскажи о задаче, которую хочется решить.
+    validations:
+      required: true
+  - type: textarea
+    id: idea
+    attributes:
+      label: Как это могло бы работать?
+      description: Пример или набросок поможет понять идею.
+    validations:
+      required: true

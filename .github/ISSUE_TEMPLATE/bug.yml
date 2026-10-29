@@ -1,0 +1,29 @@
+name: Сообщить об ошибке
+description: Что-то не работает или работает не так, как ожидалось
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Что произошло?
+      description: Опиши проблему и ожидаемое поведение.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Как повторить?
+      placeholder: Открыл приложение, изменил настройку…
+    validations:
+      required: true
+  - type: input
+    id: versions
+    attributes:
+      label: Версии приложения, Windows и Telegram
+    validations:
+      required: true
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Диагностика или журнал
+      description: Удали секрет подключения, приватные домены и личные данные перед отправкой.
+      render: text
