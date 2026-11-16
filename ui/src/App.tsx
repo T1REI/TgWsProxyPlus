@@ -581,10 +581,10 @@ export default function App() {
                 )}
                 {toggle(
                   "no_secure",
-                  t("Отключить secure transport", "Disable secure transport"),
+                  t("Без TLS (WebSocket, порт 80)", "Without TLS (WebSocket, port 80)"),
                   t(
-                    "Режим совместимости. Обычно выключен.",
-                    "Compatibility mode. Usually disabled.",
+                    "Для сетей, где TLS не проходит. MTProto остаётся зашифрованным; дополнительный TLS-слой и H2 отключаются.",
+                    "For networks where TLS fails. MTProto stays encrypted; the extra TLS layer and H2 are disabled.",
                   ),
                 )}
               </section>

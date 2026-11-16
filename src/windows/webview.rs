@@ -12,8 +12,8 @@ use windows::{
 use super::{EVENT, Event, wide};
 
 include!(concat!(env!("OUT_DIR"), "/ui_assets.rs"));
-const ORIGIN: &str = "https://tgws.local";
-const DOCUMENT: &str = "https://tgws.local/index.html";
+const ORIGIN: &str = "https://tgws.example";
+pub(super) const DOCUMENT: &str = "https://tgws.example/index.html";
 
 #[derive(Default)]
 pub enum State {

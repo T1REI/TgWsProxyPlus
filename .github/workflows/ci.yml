@@ -57,7 +57,7 @@ jobs:
         run: |
           New-Item -ItemType Directory -Path dist -Force | Out-Null
           Copy-Item -LiteralPath $env:BINARY_PATH -Destination "dist/$env:ASSET_NAME"
-          Copy-Item -LiteralPath LICENSE,LICENSE.upstream,THIRD_PARTY_NOTICES.txt,README.md,CONTRIBUTING.md -Destination dist
+          Copy-Item -LiteralPath LICENSE,LICENSE.upstream,THIRD_PARTY_NOTICES.txt,README.md,CHANGELOG.md,CONTRIBUTING.md -Destination dist
           Copy-Item -LiteralPath docs -Destination dist -Recurse -Force
           New-Item -ItemType Directory -Path dist/assets -Force | Out-Null
           Copy-Item -LiteralPath assets/brand,assets/screenshots -Destination dist/assets -Recurse -Force

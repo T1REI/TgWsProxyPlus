@@ -398,6 +398,27 @@ pub async fn diagnose(config: Config) -> Result<Vec<String>> {
                 }
                 anyhow::bail!("no CF WebSocket route")
             });
+            if !routing.config.no_secure {
+                let r = routing.clone();
+                let plain_domains = domains.clone();
+                probe(
+                    &mut jobs,
+                    format!("DC{dc:03} CF WS without TLS (probe only)"),
+                    async move {
+                        for base in plain_domains {
+                            let host = format!("kws{dc}.{base}");
+                            if r.network
+                                .websocket(&host, &host, "/apiws", false, false)
+                                .await
+                                .is_ok()
+                            {
+                                return Ok(());
+                            }
+                        }
+                        anyhow::bail!("no CF WebSocket route without TLS")
+                    },
+                );
+            }
             if routing.config.h2_enabled() {
                 let r = routing.clone();
                 probe(&mut jobs, format!("DC{dc:03} CF H2"), async move {
@@ -431,5 +452,11 @@ pub async fn diagnose(config: Config) -> Result<Vec<String>> {
         results.push(format!("{name}: {status}"));
     }
     results.sort();
+    if results
+        .iter()
+        .any(|line| line.contains("CF WS without TLS (probe only): OK"))
+    {
+        results.push("WebSocket without TLS is reachable. If TLS routes fail, you can explicitly enable no_secure in connection settings. MTProto stays encrypted; the extra TLS layer and H2 are disabled. Probes do not change settings or verify MTProto delivery.".into());
+    }
     Ok(results)
 }

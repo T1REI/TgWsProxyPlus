@@ -15,6 +15,17 @@ cargo test --locked --test live_telegram -- --ignored --nocapture
 
 Они проверяют анонимный req_pq_multi/resPQ с nonce. Их результат зависит от сети; локальные проверки используют loopback или in-memory duplex. Перед пересборкой завершите GUI, запущенный из `target/debug`, иначе Windows не позволит заменить исполняемый файл.
 
+Для раздельной проверки CF WebSocket с TLS и без него:
+
+```powershell
+cargo test --locked --test live_telegram telegram_cf_websocket -- --ignored --nocapture
+cargo test --locked --test live_telegram telegram_cf_plain_websocket -- --ignored --nocapture
+```
+
+Вторая команда явно выбирает WebSocket на порту 80 без дополнительного TLS-слоя. MTProto остаётся зашифрованным; настройки приложения не меняются. В отличие от обычного `--diagnose`, эти тесты проверяют доставку сообщения до Telegram, а не только установку транспортного соединения.
+
+`--diagnose` при включённом TLS дополнительно проверяет **CF WS without TLS (probe only)** и сообщает о доступном режиме `no_secure`. Диагностика сама его не включает. Регрессионные тесты `performance` проверяют, что зависшие основные маршруты отменяются после своего бюджета и резервный TCP получает время на подключение, а успешный основной маршрут не запускает резервный.
+
 `fixtures/python-reference.json` создан вызовами оригинального Python-кода. Для повторной генерации клонируйте [Flowseal/tg-ws-proxy](https://github.com/Flowseal/tg-ws-proxy) в `upstream/` и выберите commit `307a384ab7f522e34bb1a045884d0bd90f40bee5`. Затем установите Python-зависимости из `upstream/pyproject.toml` в отдельное `tests/.venv` и выполните `tests/.venv/Scripts/python.exe tests/generate_vectors.py`. Для обычного Cargo-прогона достаточно сохранённого JSON.
 
 Локальные тесты не подтверждают доступность публичных ретрансляторов. Звонки Telegram в эти проверки не входят: приложение не предоставляет VPN-туннель.

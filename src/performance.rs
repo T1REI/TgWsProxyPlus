@@ -1,5 +1,5 @@
 use crate::network::Stream;
-use anyhow::{Result, bail};
+use anyhow::{Context as _, Result, bail};
 use futures_util::{StreamExt, future::BoxFuture, stream::FuturesUnordered};
 use std::{
     pin::Pin,
@@ -9,7 +9,7 @@ use std::{
 };
 use tokio::{
     io::{AsyncRead, AsyncWrite, ReadBuf},
-    time::sleep,
+    time::{sleep, timeout},
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -364,5 +364,24 @@ pub async fn race<'a, T: 'a>(
         Err(error)
     } else {
         bail!("no available routes; retry after cooldown")
+    }
+}
+
+pub async fn race_with_fallback<'a, T: 'a>(
+    attempts: impl IntoIterator<Item = BoxFuture<'a, Result<T>>>,
+    delay: Duration,
+    budget: Duration,
+    fallback: Option<BoxFuture<'a, Result<T>>>,
+) -> Result<T> {
+    let result = timeout(budget, race(attempts, delay))
+        .await
+        .context("primary routes timed out")
+        .and_then(|result| result);
+    match result {
+        Ok(value) => Ok(value),
+        Err(error) => match fallback {
+            Some(attempt) => attempt.await,
+            None => Err(error),
+        },
     }
 }

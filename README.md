@@ -1,27 +1,39 @@
+<h1 align="center">TgWsProxy+</h1>
+<p align="center">Локальный MTProto-прокси для Telegram. Rust, трей Windows и компактный интерфейс.</p>
 <p align="center">
-  <img src="assets/brand/banner.svg" alt="TgWsProxy+ — локальный прокси для Telegram Desktop" width="100%" />
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-green" alt="MIT license"></a>
+  <a href="https://github.com/T1REI/TgWsProxyPlus/releases/latest"><img src="https://img.shields.io/github/v/release/T1REI/TgWsProxyPlus" alt="Latest release"></a>
+  <a href="https://github.com/T1REI/TgWsProxyPlus/actions/workflows/ci.yml"><img src="https://github.com/T1REI/TgWsProxyPlus/actions/workflows/ci.yml/badge.svg" alt="Build and tests"></a>
+  <a href="https://github.com/T1REI/TgWsProxyPlus/releases"><img src="https://img.shields.io/github/downloads/T1REI/TgWsProxyPlus/total" alt="Release downloads"></a>
 </p>
-
 <p align="center">
-  <img src="https://img.shields.io/badge/версия-0.0.2-292929?style=flat-square" alt="0.0.2" />
-  <img src="https://img.shields.io/badge/Windows-10%20%2F%2011-292929?style=flat-square" alt="Windows 10 / 11" />
-  <a href="LICENSE"><img src="https://img.shields.io/badge/лицензия-MIT-292929?style=flat-square" alt="MIT" /></a>
+  <img src="assets/screenshots/overview.png" width="760" alt="TgWsProxy+: состояние локального прокси и статистика трафика">
 </p>
-
 <p align="center">
-  <a href="#первый-запуск">Начать</a> ·
-  <a href="#сборка">Собрать</a> ·
-  <a href="docs/architecture.md">Как устроено</a> ·
-  <a href="CONTRIBUTING.md">Помочь проекту</a>
+  <a href="#первый-запуск">Первый запуск</a> ·
+  <a href="#если-telegram-не-подключается">Диагностика</a> ·
+  <a href="#сборка">Сборка</a> ·
+  <a href="CHANGELOG.md">Изменения</a> ·
+  <a href="docs/architecture.md">Архитектура</a> ·
+  <a href="CONTRIBUTING.md">Участие в проекте</a>
 </p>
 
 TgWsProxy+ — небольшой локальный прокси для Telegram Desktop. Он принимает MTProto-соединения на твоём компьютере и передаёт их через WebSocket или резервные маршруты, когда обычный путь недоступен.
 
 Включил прокси один раз — дальше приложение остаётся в трее. Один клик по значку открывает Telegram, правый клик — меню приложения.
 
-> **Переход с 0.2.x:** скачай 0.0.2 вручную, закрой прежний экземпляр через меню трея и замени EXE. Нумерация начинается заново, поэтому старое приложение не предложит эту версию автоматически. Настройки сохранятся.
+## Что нового в 0.0.3
 
-<p align="center"><img src="assets/screenshots/overview.png" alt="Тёмный интерфейс TgWsProxy+: состояние локального прокси и статистика трафика" width="100%" /></p>
+Выпуск от 16 ноября 2026 года.
+
+- **UI открывается быстрее:** медиана готовности окна в трёх локальных замерах сократилась с 2,55 до 0,57 секунды — примерно в 4,5 раза. [Методика измерения](docs/ui-startup.md).
+- **Исправлен резервный TCP:** зависшие WS-маршруты больше не лишают его времени на подключение.
+- **Диагностика проверяет WebSocket без TLS** и подсказывает подходящий режим при недоступности TLS-маршрутов. Переключатель в настройках получил понятное описание.
+- **Обновлено оформление README:** добавлены динамические бейджи лицензии, релиза, проверок и скачиваний.
+
+Полный список изменений и выполненных проверок — в [журнале версий](CHANGELOG.md).
+
+> **Переход с 0.2.x:** скачай 0.0.3 вручную, закрой прежний экземпляр через меню трея и замени EXE. Нумерация начинается заново, поэтому старое приложение не предложит эту версию автоматически. Настройки сохранятся.
 
 ## Что внутри
 
@@ -47,6 +59,17 @@ TgWsProxy+ — небольшой локальный прокси для Telegra
 **ЛКМ по трею** открывает Telegram. **ПКМ → Открыть TgWsProxy+** показывает интерфейс. Для полного завершения выбери **Выход**. Повторный запуск EXE открывает окно уже работающего экземпляра.
 
 Если локальный сервер не может запуститься, приложение покажет сообщение с причиной. Доступность удалённых маршрутов проверяется отдельно в разделе «Диагностика».
+
+## Если Telegram не подключается
+
+Открой **Диагностика → Проверить соединения** или выполни `TgWsProxyPlus --diagnose`. Запущенный локальный сервер ещё не означает, что удалённые маршруты доступны.
+
+- `bad > 0`: проверь адрес, порт и секрет; добавь прокси в Telegram заново после изменения настроек.
+- `TCP connect timed out`: прямой адрес Telegram недоступен из текущей сети.
+- CF WS/H2 зависают на TLS, но **CF WS without TLS** отвечает: в настройках подключения включи **Без TLS** (`"no_secure": true` в JSON) и сохрани. Этот режим использует WebSocket на порту 80; H2 отключается. MTProto-шифрование сохраняется, дополнительный TLS-слой отсутствует. Включай его осознанно; когда TLS снова доступен, выключи.
+- Не отвечают и резервные маршруты: проверь другую сеть или настрой собственный [Cloudflare Worker](https://github.com/Flowseal/tg-ws-proxy/blob/main/docs/RU/CfWorker.md). Доступность публичных серверов зависит от сети.
+
+Не публикуй конфигурацию целиком и ссылку `tg://proxy`: в них есть секрет. Для отчёта об ошибке достаточно версии, текста диагностики и журнала с удалёнными секретами.
 
 ## Настройки и переносной режим
 
@@ -94,7 +117,7 @@ TgWsProxyPlus --help
 
 ## Документация
 
-[Архитектура](docs/architecture.md) · [Измерения 0.0.2](docs/ui-0.0.2.md) · [Сетевые измерения](docs/performance.md) · [Сверка с upstream](docs/upstream-audit.md) · [Тесты](tests/README.md)
+[История изменений](CHANGELOG.md) · [Архитектура](docs/architecture.md) · [Измерения 0.0.2](docs/ui-0.0.2.md) · [Скорость открытия UI](docs/ui-startup.md) · [Сетевые измерения](docs/performance.md) · [Сверка с upstream](docs/upstream-audit.md) · [Тесты](tests/README.md)
 
 Нашёл ошибку или есть идея — [открой issue](https://github.com/T1REI/TgWsProxyPlus/issues). Как собрать проект и подготовить изменение, описано в [CONTRIBUTING.md](CONTRIBUTING.md).
 

@@ -14,7 +14,7 @@ try {
     $packageDirectory = Join-Path $projectRoot ('target/package-' + [guid]::NewGuid().ToString('N'))
     New-Item -ItemType Directory -Path $packageDirectory,dist -Force | Out-Null
     Copy-Item -LiteralPath target/release/TgWsProxyPlus.exe -Destination "$packageDirectory/TgWsProxyPlus.exe"
-    Copy-Item -LiteralPath LICENSE,LICENSE.upstream,THIRD_PARTY_NOTICES.txt,README.md,CONTRIBUTING.md -Destination $packageDirectory
+    Copy-Item -LiteralPath LICENSE,LICENSE.upstream,THIRD_PARTY_NOTICES.txt,README.md,CHANGELOG.md,CONTRIBUTING.md -Destination $packageDirectory
     Copy-Item -LiteralPath docs -Destination $packageDirectory -Recurse
     New-Item -ItemType Directory -Path "$packageDirectory/assets" -Force | Out-Null
     Copy-Item -LiteralPath assets/brand,assets/screenshots -Destination "$packageDirectory/assets" -Recurse

@@ -167,8 +167,8 @@ fn system_webview_renders_and_saves_without_restarting_for_theme() {
             *ui.borrow().webview.borrow(),
             webview::State::Empty
         ));
-        ui.borrow_mut().show().unwrap();
         let started = Instant::now();
+        ui.borrow_mut().show().unwrap();
         loop {
             pump();
             let state = ui.borrow();
@@ -184,6 +184,15 @@ fn system_webview_renders_and_saves_without_restarting_for_theme() {
         until(
             &ui,
             "document.querySelector('main h1')?.textContent === 'Прокси' && !document.querySelector('.proxy-error') && document.querySelector('.main-actions .primary')?.disabled === false",
+        );
+        let ready_ms = started.elapsed().as_millis();
+        let paints = evaluate(
+            &ui,
+            "({paints: performance.getEntriesByType('paint').map(p=>({name:p.name,ms:p.startTime})), navigation: performance.getEntriesByType('navigation').map(p=>({dom_ms:p.domContentLoadedEventEnd,response_ms:p.responseEnd,load_ms:p.loadEventEnd})), resources:performance.getEntriesByType('resource').map(p=>({name:p.name,start:p.startTime,duration:p.duration}))})",
+        );
+        eprintln!(
+            "UI_STARTUP {}",
+            serde_json::json!({"ready_ms": ready_ms,"page":paints})
         );
         screenshot(&ui, "overview.png");
         assert_eq!(
@@ -318,10 +327,7 @@ fn system_webview_renders_and_saves_without_restarting_for_theme() {
             .Navigate(PCWSTR(wide("https://example.com/").as_ptr()))
             .unwrap();
         pump();
-        assert_eq!(
-            evaluate(&ui, "location.href"),
-            "https://tgws.local/index.html"
-        );
+        assert_eq!(evaluate(&ui, "location.href"), webview::DOCUMENT);
         SetWindowPos(hwnd, null_mut(), 0, 0, 580, 460, SWP_NOMOVE | SWP_NOZORDER);
         for page in [
             "overview",
@@ -358,11 +364,25 @@ fn system_webview_renders_and_saves_without_restarting_for_theme() {
             "document.querySelector('nav button[data-page=overview]').getAttribute('aria-current') === 'page'",
         );
         screenshot(&ui, "overview-small.png");
+        let time_origin = evaluate(&ui, "performance.timeOrigin");
         let port = ui.borrow().config.port;
         SendMessageW(hwnd, WM_CLOSE, 0, 0);
         assert_eq!(IsWindowVisible(hwnd), 0);
         assert!(ui.borrow().ready);
         assert!(std::net::TcpStream::connect(("127.0.0.1", port)).is_ok());
+        let reopened = Instant::now();
+        ui.borrow_mut().show().unwrap();
+        until(
+            &ui,
+            "document.querySelector('.main-actions .primary')?.disabled === false",
+        );
+        eprintln!(
+            "UI_REOPEN {}",
+            serde_json::json!({"ready_ms": reopened.elapsed().as_millis()})
+        );
+        assert_eq!(evaluate(&ui, "performance.timeOrigin"), time_origin);
+        assert_eq!(ui.borrow().generation, 2);
+        assert_ne!(IsWindowVisible(hwnd), 0);
         ui.borrow_mut().proxy.take();
         *ui.borrow().webview.borrow_mut() = webview::State::Empty;
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);

@@ -8,7 +8,7 @@ use crate::{
     pool::{Key, Pool},
     stats::Stats,
 };
-use anyhow::{Context, Result};
+use anyhow::Result;
 use futures_util::FutureExt;
 use std::{
     collections::BTreeMap,
@@ -238,22 +238,13 @@ impl Routing {
             }
             .boxed()
         };
-        let selection = timeout(Duration::from_secs(16), async {
-            match performance::race(
-                candidates.into_iter().map(|(_, route)| attempt(route)),
-                Duration::from_millis(200),
-            )
-            .await
-            {
-                Ok(selection) => Ok(selection),
-                Err(error) => match fallback {
-                    Some(route) => attempt(route).await,
-                    None => Err(error),
-                },
-            }
-        })
-        .await
-        .context("route selection timed out")??;
+        let selection = performance::race_with_fallback(
+            candidates.into_iter().map(|(_, route)| attempt(route)),
+            Duration::from_millis(200),
+            Duration::from_secs(8),
+            fallback.map(attempt),
+        )
+        .await?;
         if matches!(selection.route.kind, Kind::H2 | Kind::WebSocket)
             && let Some((_, base)) = selection.route.endpoint.split_once('.')
         {

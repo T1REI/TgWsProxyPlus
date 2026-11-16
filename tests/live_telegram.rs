@@ -20,16 +20,25 @@ use tokio::{
     time::timeout,
 };
 
-async fn anonymous_probe(websocket: bool) -> Result<()> {
+async fn anonymous_probe(route: &str) -> Result<()> {
     timeout(Duration::from_secs(40), async {
         let network = Network::new(256 * 1024)?;
         let stats = Arc::new(Stats::default());
         let (mut peer, client) = tokio::io::duplex(8192);
         let (init, mut tx, mut rx) = support::client(Protocol::Intermediate);
         let relay = crypto::relay_init(Protocol::Intermediate, 2, false)?;
-        let bridge = if websocket {
-            let pool = Pool::new(Arc::new(Config::fresh()?), network.clone(), stats.clone());
-            let socket = pool.connect(Key::Direct(2, false, false)).await?;
+        let bridge = if route != "tcp" {
+            let socket = if route == "direct" {
+                let pool = Pool::new(Arc::new(Config::fresh()?), network.clone(), stats.clone());
+                pool.connect(Key::Direct(2, false, false)).await?
+            } else {
+                let config = Config::fresh()?;
+                let domains = routing::Domains::new(&config);
+                let host = format!("kws2.{}", domains.list[0]);
+                network
+                    .websocket(&host, &host, "/apiws", route != "cf_plain", false)
+                    .await?
+            };
             tokio::spawn(async move {
                 server::bridge_ws(Box::new(client), socket, init, relay, true, &stats).await
             })
@@ -81,11 +90,23 @@ async fn anonymous_probe(websocket: bool) -> Result<()> {
 #[tokio::test]
 #[ignore = "requires access to Telegram DC2; sends anonymous req_pq_multi only"]
 async fn telegram_tcp_returns_matching_res_pq() -> Result<()> {
-    anonymous_probe(false).await
+    anonymous_probe("tcp").await
 }
 
 #[tokio::test]
 #[ignore = "requires access to Telegram WebSocket DC2; sends anonymous req_pq_multi only"]
 async fn telegram_websocket_returns_matching_res_pq() -> Result<()> {
-    anonymous_probe(true).await
+    anonymous_probe("direct").await
+}
+
+#[tokio::test]
+#[ignore = "requires access to public CF WebSocket DC2; sends anonymous req_pq_multi only"]
+async fn telegram_cf_websocket_returns_matching_res_pq() -> Result<()> {
+    anonymous_probe("cf").await
+}
+
+#[tokio::test]
+#[ignore = "explicit plaintext WebSocket probe; MTProto stays encrypted; sends anonymous req_pq_multi only"]
+async fn telegram_cf_plain_websocket_returns_matching_res_pq() -> Result<()> {
+    anonymous_probe("cf_plain").await
 }

@@ -112,6 +112,58 @@ async fn cancelling_selection_drops_all_pending_handshakes() {
     assert_eq!(active.load(SeqCst), 0);
 }
 
+#[tokio::test]
+async fn stalled_primary_routes_leave_time_for_tcp_fallback() {
+    let active = Arc::new(AtomicUsize::new(0));
+    let attempts = (0..12).map(|_| {
+        let active = active.clone();
+        async move {
+            active.fetch_add(1, SeqCst);
+            let _guard = Active(active);
+            std::future::pending::<Result<usize>>().await
+        }
+        .boxed()
+    });
+    let fallback_active = active.clone();
+    let fallback = async move {
+        assert_eq!(fallback_active.load(SeqCst), 0);
+        sleep(Duration::from_millis(10)).await;
+        Ok(42)
+    }
+    .boxed();
+    let result = timeout(
+        Duration::from_secs(2),
+        performance::race_with_fallback(
+            attempts,
+            Duration::from_millis(5),
+            Duration::from_millis(30),
+            Some(fallback),
+        ),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(result, 42);
+    assert_eq!(active.load(SeqCst), 0);
+}
+
+#[tokio::test]
+async fn successful_primary_does_not_start_fallback() {
+    let attempts = [async { Ok(7) }.boxed()];
+    let fallback = async { panic!("fallback must remain unpolled") }.boxed();
+    assert_eq!(
+        performance::race_with_fallback(
+            attempts,
+            Duration::from_millis(5),
+            Duration::from_secs(1),
+            Some(fallback),
+        )
+        .await
+        .unwrap(),
+        7
+    );
+}
+
 #[test]
 fn route_history_ranks_latency_isolates_media_and_bounds_memory() {
     let metrics = Metrics::default();
